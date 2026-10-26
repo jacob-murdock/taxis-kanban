@@ -110,6 +110,10 @@ export class JobDO extends YjsRoom {
       return Response.json(materializeJob(this.doc));
     }
 
+    if (request.method === "GET" && url.pathname.endsWith("/history")) {
+      return this.handleHistoryRequest(url);
+    }
+
     return super.fetch(request);
   }
 
@@ -157,5 +161,51 @@ export class JobDO extends YjsRoom {
     const snapshot = materializeJob(this.doc);
     await this.ctx.storage.put("snapshot:latest", snapshot);
     console.log(`Job ${snapshot.id} snapshot materialized (${snapshot.status})`);
+  }
+
+  async handleHistoryRequest(url) {
+    await this.initChangelogTable();
+    const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
+    const rows = await this.ctx.storage.sql
+      .exec(
+        "SELECT ts, author, field, prev, next FROM changelog ORDER BY ts DESC LIMIT ?",
+        limit,
+      )
+      .toArray();
+
+    const entries = rows.map((row) => ({
+      ts: row.ts,
+      author: row.author,
+      field: row.field,
+      prev: row.prev,
+      next: row.next,
+    }));
+
+    return Response.json({ entries });
+  }
+
+  async initChangelogTable() {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS changelog (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        author TEXT NOT NULL DEFAULT 'system',
+        field TEXT NOT NULL,
+        prev TEXT,
+        next TEXT
+      )
+    `);
+  }
+
+  async appendChangelog(entry) {
+    await this.initChangelogTable();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO changelog (ts, author, field, prev, next) VALUES (?, ?, ?, ?, ?)",
+      entry.ts ?? new Date().toISOString(),
+      entry.author,
+      entry.field,
+      entry.prev,
+      entry.next,
+    );
   }
 }
