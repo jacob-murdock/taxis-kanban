@@ -81,7 +81,5 @@ export function materializeBoardCards(doc) {
 }
 
 export function generateJobId() {
-  const bytes = crypto.getRandomValues(new Uint8Array(4));
-  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-  return `job_${hex}`;
+  return `job_${crypto.randomUUID()}`;
 }
