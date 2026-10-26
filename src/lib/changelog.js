@@ -1,20 +1,20 @@
-/** Compare materialized job snapshots for changelog projection. */
+/** Compare materialized card snapshots for changelog projection. */
+
+function labelsKey(labels) {
+  return JSON.stringify(Array.isArray(labels) ? labels : []);
+}
 
 const TRACKED = [
-  { field: "title", get: (j) => j.title },
-  { field: "status", get: (j) => j.status },
-  { field: "slug", get: (j) => j.slug },
-  { field: "client.name", get: (j) => j.client?.name ?? "" },
-  { field: "client.contact", get: (j) => j.client?.contact ?? "" },
-  {
-    field: "amount",
-    get: (j) => (j.amount?.value ? String(j.amount.value) : "0"),
-  },
-  { field: "due", get: (j) => j.due ?? "" },
-  { field: "body", get: (j) => j.body ?? "" },
+  { field: "title", get: (c) => c.title ?? "" },
+  { field: "columnId", get: (c) => c.columnId ?? "" },
+  { field: "due", get: (c) => c.due ?? "" },
+  { field: "assignee", get: (c) => c.assignee ?? "" },
+  { field: "labels", get: (c) => labelsKey(c.labels) },
+  { field: "archived", get: (c) => (c.archived ? "true" : "false") },
+  { field: "body", get: (c) => c.body ?? "" },
 ];
 
-export function diffJobSnapshots(prev, next) {
+export function diffCardSnapshots(prev, next) {
   const changes = [];
   for (const { field, get } of TRACKED) {
     const before = get(prev);

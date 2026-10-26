@@ -1,21 +1,31 @@
 import { YjsRoom } from "./yjs-room.js";
-import { createEmptyJobDoc, materializeJob } from "../lib/materialize.js";
-import { diffJobSnapshots } from "../lib/changelog.js";
-import { GIT_FLUSH_ALARM_MS, JOB_STATUSES, WORKSPACE_ID } from "../lib/constants.js";
+import { createEmptyCardDoc, materializeCard } from "../lib/materialize.js";
+import { diffCardSnapshots } from "../lib/changelog.js";
+import { SNAPSHOT_ALARM_MS } from "../lib/constants.js";
+import { readJson } from "../lib/json.js";
+import {
+  clampLabels,
+  clampLiveAssignee,
+  clampLiveDue,
+  clampLiveTitle,
+  clampStoredTitle,
+  sameLabels,
+} from "../lib/fields.js";
 
 const CHANGELOG_DEBOUNCE_MS = 400;
 
-// Card summary fields mirrored to the board; changes to these trigger a board sync.
-const SUMMARY_FIELDS = new Set(["title", "status", "slug", "due", "client.name"]);
+// Board-card summary fields; columnId and rank are owned by BoardDO placement.
+const SUMMARY_FIELDS = new Set(["title", "due", "assignee", "labels", "archived"]);
 
 export class JobDO extends YjsRoom {
   constructor(ctx, env) {
     super(ctx, env, {
-      createDoc: () => createEmptyJobDoc(null),
+      createDoc: () => createEmptyCardDoc(null, null),
     });
     this.changelogReady = false;
     this.lastSnapshot = null;
     this.changelogTimer = null;
+    this.suspendChangelog = false;
   }
 
   async ensureDoc() {
@@ -23,20 +33,31 @@ export class JobDO extends YjsRoom {
     if (!this.changelogReady) {
       this.changelogReady = true;
       await this.initChangelogTable();
-      this.lastSnapshot = materializeJob(doc);
+      this.lastSnapshot = materializeCard(doc);
       this.wireChangelog(doc);
     }
     return doc;
   }
 
+  async requireReady() {
+    if (await this.isTombstoned()) {
+      return Response.json({ error: "Card not found" }, { status: 404 });
+    }
+    if (!(await this.isReady())) {
+      return Response.json({ error: "Card not found" }, { status: 404 });
+    }
+    await this.ensureDoc();
+    return null;
+  }
+
   wireChangelog(doc) {
-    // Any change (local, remote, or server-side) projects to the changelog and
-    // schedules the debounced git-mirror flush.
     const onChange = () => {
+      if (this.suspendChangelog) return;
       this.scheduleChangelog();
-      void this.scheduleGitFlush();
+      void this.scheduleSnapshotAlarm();
     };
     doc.getMap("fields").observeDeep(onChange);
+    doc.getArray("labels").observe(onChange);
     doc.getText("body").observe(onChange);
   }
 
@@ -49,13 +70,22 @@ export class JobDO extends YjsRoom {
   }
 
   async flushChangelog() {
-    if (!this.doc || !this.lastSnapshot) return;
+    if (this.suspendChangelog || !this.doc || !this.lastSnapshot) return;
+    if (await this.isTombstoned()) return;
 
-    const next = materializeJob(this.doc);
-    const changes = diffJobSnapshots(this.lastSnapshot, next);
+    const next = materializeCard(this.doc);
+    const changes = diffCardSnapshots(this.lastSnapshot, next);
     if (changes.length === 0) return;
     this.lastSnapshot = next;
 
+    await this.recordChanges(changes);
+
+    if (changes.some((c) => SUMMARY_FIELDS.has(c.field))) {
+      await this.syncCardToBoard(next);
+    }
+  }
+
+  async recordChanges(changes) {
     for (const change of changes) {
       await this.appendChangelog({
         author: "editor",
@@ -64,92 +94,284 @@ export class JobDO extends YjsRoom {
         next: change.next,
       });
     }
-
-    if (changes.some((c) => SUMMARY_FIELDS.has(c.field))) {
-      await this.syncCardToBoard(next);
-    }
   }
 
-  /** Push this job's summary to the board so the card reflects field edits. */
+  /** Push summary fields to the board; leaves columnId and rank alone. */
   async syncCardToBoard(snapshot) {
-    if (!snapshot.id) return;
+    if (!snapshot.id || !snapshot.boardId) return false;
     try {
-      const stub = this.env.BOARD_DO.get(this.env.BOARD_DO.idFromName(WORKSPACE_ID));
-      await stub.fetch(
-        new Request("https://do.internal/cards", {
+      const stub = this.env.BOARD_DO.get(this.env.BOARD_DO.idFromName(snapshot.boardId));
+      const response = await stub.fetch(
+        new Request("https://do.internal/cards/summary", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             id: snapshot.id,
-            slug: snapshot.slug,
             title: snapshot.title,
-            clientName: snapshot.client.name,
             due: snapshot.due,
-            status: snapshot.status,
+            assignee: snapshot.assignee,
+            labels: snapshot.labels,
+            archived: snapshot.archived,
           }),
         }),
       );
+      if (!response.ok) {
+        console.error(`Card sync failed for ${snapshot.id}: ${response.status}`);
+        return false;
+      }
+      return true;
     } catch (err) {
       console.error(`Card sync failed for ${snapshot.id}`, err);
+      return false;
     }
   }
 
   async fetch(request) {
     const url = new URL(request.url);
+    const path = url.pathname;
 
-    if (request.method === "POST" && url.pathname.endsWith("/init")) {
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      const gate = await this.requireReady();
+      if (gate) return gate;
+      const boardId = url.searchParams.get("boardId");
+      if (!boardId || this.doc.getMap("fields").get("boardId") !== boardId) {
+        return Response.json({ error: "Card does not belong to this board" }, { status: 403 });
+      }
+      return super.fetch(request);
+    }
+
+    if (request.method === "POST" && path.endsWith("/init")) {
       return this.handleInit(request);
     }
 
-    if (request.method === "POST" && url.pathname.endsWith("/status")) {
-      return this.handleSetStatus(request);
+    if (request.method === "DELETE" && path.endsWith("/destroy")) {
+      return this.handleDelete();
     }
 
-    if (request.method === "GET" && url.pathname.endsWith("/snapshot")) {
-      await this.ensureDoc();
-      return Response.json(materializeJob(this.doc));
+    const gate = await this.requireReady();
+    if (gate) return gate;
+
+    if (request.method === "POST" && path.endsWith("/column")) {
+      return this.handleSetColumn(request);
     }
 
-    if (request.method === "GET" && url.pathname.endsWith("/history")) {
+    if (request.method === "POST" && path.endsWith("/archive")) {
+      return this.handleArchive(request);
+    }
+
+    if (request.method === "GET" && path.endsWith("/snapshot")) {
+      return Response.json(materializeCard(this.doc));
+    }
+
+    if (request.method === "GET" && path.endsWith("/history")) {
       return this.handleHistoryRequest(url);
     }
 
     return super.fetch(request);
   }
 
-  async handleInit(request) {
-    const body = await request.json();
+  async webSocketMessage(ws, message) {
+    if (typeof message === "string") return;
+    if (await this.isTombstoned()) return;
+    if (!(await this.isReady())) return;
 
     await this.ensureDoc();
-    // Mutating fields fires the doc "update" handler, which persists state.
-    this.doc.transact(() => {
-      const fields = this.doc.getMap("fields");
-      fields.set("id", body.id);
-      fields.set("slug", body.slug);
-      fields.set("title", body.title);
-    });
+    const before = this.captureProtected();
+    this.suspendChangelog = true;
+    try {
+      await super.webSocketMessage(ws, message);
+      this.reconcileRemote(before);
+    } finally {
+      this.suspendChangelog = false;
+    }
     await this.flushChangelog();
+  }
+
+  captureProtected() {
+    const fields = this.doc.getMap("fields");
+    return {
+      id: fields.get("id"),
+      boardId: fields.get("boardId"),
+      columnId: fields.get("columnId"),
+      title: fields.get("title"),
+      assignee: fields.get("assignee"),
+      due: fields.get("due"),
+      archived: fields.get("archived"),
+    };
+  }
+
+  /** Put protected keys back and clamp title, assignee, due, and labels. */
+  reconcileRemote(before) {
+    const fields = this.doc.getMap("fields");
+    const labels = this.doc.getArray("labels");
+    const currentLabels = labels.toArray();
+    const nextLabels = clampLabels(currentLabels);
+    const nextTitle = clampLiveTitle(fields.get("title"), before.title);
+    const nextAssignee = clampLiveAssignee(fields.get("assignee"), before.assignee);
+    const nextDue = clampLiveDue(fields.get("due"), before.due);
+    const archived = fields.get("archived");
+    const nextArchived = typeof archived === "boolean" ? archived : before.archived;
+
+    const idDrift = fields.get("id") !== before.id;
+    const boardDrift = fields.get("boardId") !== before.boardId;
+    const columnDrift = fields.get("columnId") !== before.columnId;
+    const titleDrift = fields.get("title") !== nextTitle;
+    const assigneeDrift = fields.get("assignee") !== nextAssignee;
+    const dueDrift = fields.get("due") !== nextDue;
+    const archivedDrift = archived !== nextArchived;
+    const labelsDrift = !sameLabels(currentLabels, nextLabels);
+    if (
+      !idDrift &&
+      !boardDrift &&
+      !columnDrift &&
+      !titleDrift &&
+      !assigneeDrift &&
+      !dueDrift &&
+      !archivedDrift &&
+      !labelsDrift
+    ) {
+      return;
+    }
+
+    this.doc.transact(() => {
+      if (idDrift) fields.set("id", before.id);
+      if (boardDrift) fields.set("boardId", before.boardId);
+      if (columnDrift) fields.set("columnId", before.columnId);
+      if (titleDrift) fields.set("title", nextTitle);
+      if (assigneeDrift) fields.set("assignee", nextAssignee);
+      if (dueDrift) fields.set("due", nextDue);
+      if (archivedDrift) fields.set("archived", nextArchived);
+      if (labelsDrift) {
+        if (labels.length) labels.delete(0, labels.length);
+        if (nextLabels.length) labels.push(nextLabels);
+      }
+    });
+  }
+
+  /**
+   * Seed the card doc. Writes changelog only — BoardDO insert owns the card
+   * summary, so we must not sync to the board here.
+   */
+  async handleInit(request) {
+    if (await this.isTombstoned()) {
+      return Response.json({ error: "Card not found" }, { status: 404 });
+    }
+    if (await this.isReady()) {
+      return Response.json({ error: "Card already exists" }, { status: 409 });
+    }
+
+    const { body, error } = await readJson(request);
+    if (error) return error;
+    if (!body.id || !body.boardId) {
+      return Response.json({ error: "id and boardId are required" }, { status: 400 });
+    }
+
+    await this.ensureDoc();
+    this.suspendChangelog = true;
+    try {
+      this.doc.transact(() => {
+        const fields = this.doc.getMap("fields");
+        fields.set("id", body.id);
+        fields.set("boardId", body.boardId);
+        if (body.title !== undefined) fields.set("title", clampStoredTitle(body.title));
+        if (body.columnId !== undefined) fields.set("columnId", body.columnId);
+      });
+
+      const next = materializeCard(this.doc);
+      const changes = diffCardSnapshots(this.lastSnapshot, next);
+      this.lastSnapshot = next;
+      await this.recordChanges(changes);
+      await this.markReady();
+    } finally {
+      this.suspendChangelog = false;
+    }
 
     return Response.json({ ok: true }, { status: 201 });
   }
 
-  /** Set status from a board drag/drop. JobDO remains the source of truth. */
-  async handleSetStatus(request) {
-    const { status } = await request.json();
-    if (!JOB_STATUSES.includes(status)) {
-      return Response.json({ error: "Invalid status" }, { status: 400 });
+  async handleSetColumn(request) {
+    const { body, error } = await readJson(request);
+    if (error) return error;
+    if (!body.columnId || typeof body.columnId !== "string") {
+      return Response.json({ error: "columnId is required" }, { status: 400 });
     }
 
-    await this.ensureDoc();
-    this.doc.transact(() => this.doc.getMap("fields").set("status", status));
+    const boardCheck = this.requireBoard(body.boardId);
+    if (boardCheck) return boardCheck;
+
+    this.doc.transact(() => {
+      this.doc.getMap("fields").set("columnId", body.columnId);
+    });
     await this.flushChangelog();
 
     return Response.json({ ok: true });
   }
 
-  /** Debounced alarm for materialized snapshot + git mirror flush. */
-  async scheduleGitFlush() {
-    const when = Date.now() + GIT_FLUSH_ALARM_MS;
+  async handleArchive(request) {
+    const { body, error } = await readJson(request);
+    if (error) return error;
+    if (typeof body.archived !== "boolean") {
+      return Response.json({ error: "archived boolean is required" }, { status: 400 });
+    }
+
+    const boardCheck = this.requireBoard(body.boardId);
+    if (boardCheck) return boardCheck;
+
+    let next;
+    this.suspendChangelog = true;
+    try {
+      this.doc.transact(() => {
+        this.doc.getMap("fields").set("archived", body.archived);
+      });
+      next = materializeCard(this.doc);
+      const changes = diffCardSnapshots(this.lastSnapshot, next);
+      this.lastSnapshot = next;
+      await this.recordChanges(changes);
+    } finally {
+      this.suspendChangelog = false;
+    }
+
+    const synced = await this.syncCardToBoard(next);
+    if (!synced) {
+      return Response.json({ error: "Failed to sync board" }, { status: 500 });
+    }
+
+    return Response.json({ ok: true, archived: body.archived });
+  }
+
+  async handleDelete() {
+    if (await this.isTombstoned()) {
+      return Response.json({ error: "Card not found" }, { status: 404 });
+    }
+
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(1000, "deleted");
+      } catch {
+        // ignore
+      }
+    }
+
+    this.changelogReady = false;
+    this.lastSnapshot = null;
+    await this.markTombstoned();
+    return Response.json({ ok: true });
+  }
+
+  /** Reject when the request's boardId does not match the stored card. */
+  requireBoard(boardId) {
+    if (!boardId || typeof boardId !== "string") {
+      return Response.json({ error: "boardId is required" }, { status: 400 });
+    }
+    const stored = this.doc.getMap("fields").get("boardId");
+    if (stored !== boardId) {
+      return Response.json({ error: "Card does not belong to this board" }, { status: 403 });
+    }
+    return null;
+  }
+
+  async scheduleSnapshotAlarm() {
+    const when = Date.now() + SNAPSHOT_ALARM_MS;
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null || existing > when) {
       await this.ctx.storage.setAlarm(when);
@@ -157,23 +379,36 @@ export class JobDO extends YjsRoom {
   }
 
   async alarm() {
+    if (await this.isTombstoned() || !(await this.isReady())) return;
     await this.ensureDoc();
-    const snapshot = materializeJob(this.doc);
+    const snapshot = materializeCard(this.doc);
     await this.ctx.storage.put("snapshot:latest", snapshot);
-    console.log(`Job ${snapshot.id} snapshot materialized (${snapshot.status})`);
+    console.log(`Card ${snapshot.id} snapshot materialized`);
   }
 
   async handleHistoryRequest(url) {
+    const parsed = parseHistoryQuery(url);
+    if (parsed.error) return parsed.error;
+
     await this.initChangelogTable();
-    const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
-    const rows = await this.ctx.storage.sql
-      .exec(
-        "SELECT ts, author, field, prev, next FROM changelog ORDER BY ts DESC LIMIT ?",
-        limit,
-      )
-      .toArray();
+    const rows =
+      parsed.before == null
+        ? await this.ctx.storage.sql
+            .exec(
+              "SELECT id, ts, author, field, prev, next FROM changelog ORDER BY id DESC LIMIT ?",
+              parsed.limit,
+            )
+            .toArray()
+        : await this.ctx.storage.sql
+            .exec(
+              "SELECT id, ts, author, field, prev, next FROM changelog WHERE id < ? ORDER BY id DESC LIMIT ?",
+              parsed.before,
+              parsed.limit,
+            )
+            .toArray();
 
     const entries = rows.map((row) => ({
+      id: Number(row.id),
       ts: row.ts,
       author: row.author,
       field: row.field,
@@ -208,4 +443,26 @@ export class JobDO extends YjsRoom {
       entry.next,
     );
   }
+}
+
+function parseHistoryQuery(url) {
+  const limitRaw = url.searchParams.get("limit");
+  let limit = 50;
+  if (limitRaw != null && limitRaw !== "") {
+    if (!/^-?\d+$/.test(limitRaw)) {
+      return { error: Response.json({ error: "Invalid limit" }, { status: 400 }) };
+    }
+    limit = Math.min(200, Math.max(1, Number(limitRaw)));
+  }
+
+  const beforeRaw = url.searchParams.get("before");
+  let before = null;
+  if (beforeRaw != null && beforeRaw !== "") {
+    if (!/^\d+$/.test(beforeRaw) || Number(beforeRaw) < 1) {
+      return { error: Response.json({ error: "Invalid before" }, { status: 400 }) };
+    }
+    before = Number(beforeRaw);
+  }
+
+  return { limit, before, error: null };
 }

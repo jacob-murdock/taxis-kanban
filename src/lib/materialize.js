@@ -1,85 +1,135 @@
 import * as Y from "yjs";
-import { JOB_STATUSES } from "./constants.js";
+import { DEFAULT_COLUMN_NAMES } from "./constants.js";
+import { clampAssignee, clampDue, clampLabels, clampStoredTitle } from "./fields.js";
 
 function readYMapValue(map, key, fallback) {
   const value = map.get(key);
   return value === undefined ? fallback : value;
 }
 
-function readNestedMap(map, key) {
-  const nested = map.get(key);
-  if (nested instanceof Y.Map) {
-    return nested.toJSON();
-  }
-  if (nested && typeof nested === "object") {
-    return nested;
-  }
-  return {};
+export function generateBoardId() {
+  return `board_${crypto.randomUUID()}`;
 }
 
-export function createEmptyJobDoc(id) {
+export function generateCardId() {
+  return `card_${crypto.randomUUID()}`;
+}
+
+export function generateColumnId() {
+  return `col_${crypto.randomUUID()}`;
+}
+
+export function createEmptyBoardDoc(id, name = "Untitled board") {
+  const doc = new Y.Doc();
+  const meta = doc.getMap("meta");
+  meta.set("id", id ?? null);
+  meta.set("name", name);
+  meta.set("archived", false);
+
+  const columns = doc.getArray("columns");
+  for (const columnName of DEFAULT_COLUMN_NAMES) {
+    columns.push([{ id: generateColumnId(), name: columnName }]);
+  }
+
+  doc.getMap("cards");
+  return doc;
+}
+
+export function createEmptyCardDoc(id, boardId) {
   const doc = new Y.Doc();
   const fields = doc.getMap("fields");
 
-  fields.set("id", id);
-  fields.set("slug", "");
-  fields.set("title", "Untitled Job");
-  fields.set("status", "lead");
-  fields.set("client", { name: "", contact: "" });
-  fields.set("amount", { value: 0, currency: "USD" });
+  fields.set("id", id ?? null);
+  fields.set("boardId", boardId ?? null);
+  fields.set("title", "Untitled");
+  fields.set("columnId", null);
   fields.set("due", null);
-  fields.set("links", {});
-  fields.set("invoice", { sent: false, paidAt: null });
+  fields.set("assignee", "");
+  fields.set("archived", false);
 
-  doc.getText("body").insert(0, "## Background\n\n## Scope\n\n## Log\n");
+  doc.getArray("labels");
+  doc.getText("body");
 
   return doc;
 }
 
-export function materializeJob(doc) {
+export function materializeCard(doc) {
   const fields = doc.getMap("fields");
-  const body = doc.getText("body").toString();
-
-  const status = readYMapValue(fields, "status", "lead");
-  const normalizedStatus = JOB_STATUSES.includes(status) ? status : "lead";
-
-  const client = readNestedMap(fields, "client");
-  const amount = readNestedMap(fields, "amount");
-  const links = readNestedMap(fields, "links");
-  const invoice = readNestedMap(fields, "invoice");
+  const labels = doc.getArray("labels").toArray().map((label) => String(label));
 
   return {
     id: readYMapValue(fields, "id", ""),
-    slug: readYMapValue(fields, "slug", ""),
-    title: readYMapValue(fields, "title", "Untitled Job"),
-    status: normalizedStatus,
-    client: {
-      name: String(client.name ?? ""),
-      contact: String(client.contact ?? ""),
-    },
-    amount: {
-      value: Number(amount.value ?? 0),
-      currency: String(amount.currency ?? "USD"),
-    },
+    boardId: readYMapValue(fields, "boardId", ""),
+    title: readYMapValue(fields, "title", "Untitled"),
+    columnId: readYMapValue(fields, "columnId", null),
     due: readYMapValue(fields, "due", null),
-    links: {
-      repo: links.repo ? String(links.repo) : undefined,
-      staging: links.staging ? String(links.staging) : undefined,
-      prod: links.prod ? String(links.prod) : undefined,
-    },
-    invoice: {
-      sent: Boolean(invoice.sent ?? false),
-      paidAt: invoice.paidAt ? String(invoice.paidAt) : null,
-    },
-    body,
+    assignee: String(readYMapValue(fields, "assignee", "") ?? ""),
+    archived: Boolean(readYMapValue(fields, "archived", false)),
+    labels,
+    body: doc.getText("body").toString(),
   };
 }
 
-export function materializeBoardCards(doc) {
-  const cards = doc.getArray("cards");
-  return cards.toArray();
+function materializeBoardCard(entry) {
+  if (!(entry instanceof Y.Map)) return null;
+
+  const labels = entry.get("labels");
+  return {
+    id: readYMapValue(entry, "id", ""),
+    title: readYMapValue(entry, "title", ""),
+    columnId: readYMapValue(entry, "columnId", null),
+    rank: readYMapValue(entry, "rank", 0),
+    due: readYMapValue(entry, "due", null),
+    assignee: String(readYMapValue(entry, "assignee", "") ?? ""),
+    labels: Array.isArray(labels) ? labels.map(String) : [],
+    archived: Boolean(readYMapValue(entry, "archived", false)),
+    updatedAt: readYMapValue(entry, "updatedAt", null),
+  };
 }
 
-export function generateJobId() {
-  return `job_${crypto.randomUUID()}`;
+export function materializeBoard(doc) {
+  const meta = doc.getMap("meta");
+  const columns = doc.getArray("columns").toArray().map((col) => ({
+    id: col?.id ?? "",
+    name: col?.name ?? "",
+  }));
+
+  const cards = {};
+  doc.getMap("cards").forEach((value, key) => {
+    const card = materializeBoardCard(value);
+    if (card) cards[key] = card;
+  });
+
+  return {
+    id: readYMapValue(meta, "id", ""),
+    name: readYMapValue(meta, "name", ""),
+    archived: Boolean(readYMapValue(meta, "archived", false)),
+    columns,
+    cards,
+  };
+}
+
+export function materializeCatalog(doc) {
+  const boards = [];
+  doc.getMap("boards").forEach((value) => {
+    if (!(value instanceof Y.Map)) return;
+    boards.push({
+      id: readYMapValue(value, "id", ""),
+      name: readYMapValue(value, "name", ""),
+      archived: Boolean(readYMapValue(value, "archived", false)),
+      createdAt: readYMapValue(value, "createdAt", null),
+    });
+  });
+  return boards;
+}
+
+/** Write board-card summary fields onto a Y.Map without touching columnId or rank. */
+export function applyCardSummaryToYMap(cardMap, summary) {
+  if (summary.id !== undefined) cardMap.set("id", summary.id);
+  if (summary.title !== undefined) cardMap.set("title", clampStoredTitle(summary.title));
+  if (summary.due !== undefined) cardMap.set("due", clampDue(summary.due));
+  if (summary.assignee !== undefined) cardMap.set("assignee", clampAssignee(summary.assignee));
+  if (summary.labels !== undefined) cardMap.set("labels", clampLabels(summary.labels));
+  if (typeof summary.archived === "boolean") cardMap.set("archived", summary.archived);
+  cardMap.set("updatedAt", new Date().toISOString());
 }

@@ -2,6 +2,8 @@ import * as Y from "yjs";
 import { DurableObject } from "cloudflare:workers";
 
 const STORAGE_KEY_STATE = "ydoc:state";
+const STORAGE_KEY_READY = "ready";
+export const STORAGE_KEY_TOMBSTONE = "tombstone";
 
 /**
  * Shared Yjs-over-WebSocket room logic for hibernatable Durable Objects.
@@ -13,6 +15,8 @@ export class YjsRoom extends DurableObject {
     this.doc = null;
     this.docReady = null;
     this.options = options;
+    /** Cached tombstone flag; avoids a storage read on every persist. */
+    this.tombstoned = false;
   }
 
   /** Load the doc once; concurrent callers share the same promise. */
@@ -32,8 +36,8 @@ export class YjsRoom extends DurableObject {
     if (storedState) {
       Y.applyUpdate(this.doc, new Uint8Array(storedState));
     } else if (this.options.createDoc) {
+      // In memory only. Callers persist via markReady() once the doc is real.
       this.doc = this.options.createDoc();
-      await this.persistState();
     }
 
     this.doc.on("update", (update, origin) => {
@@ -47,8 +51,33 @@ export class YjsRoom extends DurableObject {
     return this.doc;
   }
 
+  async isReady() {
+    return (await this.ctx.storage.get(STORAGE_KEY_READY)) === true;
+  }
+
+  async isTombstoned() {
+    if (this.tombstoned) return true;
+    this.tombstoned = (await this.ctx.storage.get(STORAGE_KEY_TOMBSTONE)) === true;
+    return this.tombstoned;
+  }
+
+  async markTombstoned() {
+    this.tombstoned = true;
+    this.doc = null;
+    this.docReady = null;
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.put(STORAGE_KEY_TOMBSTONE, true);
+  }
+
+  /** Persist the doc and mark it visible to handlers and sockets. */
+  async markReady() {
+    await this.persistState();
+    await this.ctx.storage.put(STORAGE_KEY_READY, true);
+  }
+
   async persistState() {
-    if (!this.doc) return;
+    if (!this.doc || this.tombstoned) return;
     const state = Y.encodeStateAsUpdate(this.doc);
     await this.ctx.storage.put(STORAGE_KEY_STATE, state);
   }
@@ -75,6 +104,9 @@ export class YjsRoom extends DurableObject {
   }
 
   async webSocketMessage(ws, message) {
+    // Board/catalog rooms are read-only over the socket; mutations go through HTTP.
+    if (this.options.clientUpdates === false) return;
+
     // Yjs updates are binary; a text frame is never a valid update.
     if (typeof message === "string") return;
 

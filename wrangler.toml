@@ -14,9 +14,17 @@ class_name = "JobDO"
 name = "BOARD_DO"
 class_name = "BoardDO"
 
+[[durable_objects.bindings]]
+name = "CATALOG_DO"
+class_name = "CatalogDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["JobDO", "BoardDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CatalogDO"]
 
 [assets]
 directory = "app"
