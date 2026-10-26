@@ -1,0 +1,24 @@
+name = "taxis-kanban"
+main = "src/index.js"
+compatibility_date = "2026-06-13"
+
+# Bundles Yjs for the browser into app/js/vendor/ (runs before dev/deploy).
+[build]
+command = "npm run build:client"
+
+[[durable_objects.bindings]]
+name = "JOB_DO"
+class_name = "JobDO"
+
+[[durable_objects.bindings]]
+name = "BOARD_DO"
+class_name = "BoardDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JobDO", "BoardDO"]
+
+[assets]
+directory = "app"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
