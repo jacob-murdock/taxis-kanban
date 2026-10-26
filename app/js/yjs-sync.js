@@ -81,9 +81,3 @@ export function connectYjsRoom(url) {
 
   return { doc, ready, bindStatus, disconnect };
 }
-
-/** Board cards may be stored as objects; normalize either shape. */
-export function normalizeCard(entry) {
-  if (Array.isArray(entry)) return entry[0] ?? null;
-  return entry ?? null;
-}

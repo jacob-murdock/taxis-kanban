@@ -1,6 +1,6 @@
 import { API } from "./config.js";
 import { JOB_STATUSES } from "./constants.js";
-import { connectYjsRoom, normalizeCard } from "./yjs-sync.js";
+import { connectYjsRoom } from "./yjs-sync.js";
 
 const statusEl = document.getElementById("connection-status");
 const newJobBtn = document.getElementById("new-job-btn");
@@ -41,7 +41,6 @@ function renderFromDoc() {
   const cards = doc
     .getArray("cards")
     .toArray()
-    .map(normalizeCard)
     .filter(Boolean);
 
   for (const status of JOB_STATUSES) {
@@ -101,7 +100,7 @@ function buildCardEl(card) {
 
 function moveCard(jobId, newStatus) {
   const cards = doc.getArray("cards");
-  const items = cards.toArray().map(normalizeCard);
+  const items = cards.toArray();
   const idx = items.findIndex((c) => c.id === jobId);
   if (idx < 0) return;
 
