@@ -5,6 +5,8 @@ import { generateJobId } from "./lib/materialize.js";
 
 export { JobDO, BoardDO };
 
+const MAX_TITLE = 200;
+
 export default {
   async fetch(request, env, _ctx) {
     const url = new URL(request.url);
@@ -76,10 +78,19 @@ function buildDoRequest(request, path) {
 }
 
 async function createJob(request, env) {
-  const body = await request.json();
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "Body must be JSON" }, { status: 400 });
+  }
+  if (body?.title !== undefined && typeof body.title !== "string") {
+    return Response.json({ error: "title must be a string" }, { status: 400 });
+  }
+
+  const title = (body.title ?? "").trim().slice(0, MAX_TITLE) || "Untitled Job";
+  const slug = slugify(title) || "untitled";
   const jobId = generateJobId();
-  const slug = body.slug ?? slugify(body.title ?? "untitled");
-  const title = body.title ?? "Untitled Job";
 
   const jobStub = env.JOB_DO.get(env.JOB_DO.idFromName(jobId));
   const initResponse = await jobStub.fetch(
