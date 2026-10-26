@@ -94,12 +94,11 @@ export class YjsRoom extends DurableObject {
   }
 
   async webSocketMessage(ws, message) {
-    await this.ensureDoc();
+    // Yjs updates are binary; a text frame is never a valid update.
+    if (typeof message === "string") return;
 
-    const update =
-      typeof message === "string"
-        ? new TextEncoder().encode(message)
-        : new Uint8Array(message);
+    await this.ensureDoc();
+    const update = new Uint8Array(message);
 
     Y.applyUpdate(this.doc, update, "remote");
     this.options.onUpdateApplied?.(update);
