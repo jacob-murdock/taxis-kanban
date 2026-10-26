@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Board · Taxis Kanban</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <header class="site-header">
+    <nav><a href="/">← Boards</a></nav>
+    <h1 id="board-name" contenteditable="plaintext-only" spellcheck="true" aria-label="Board name">Loading…</h1>
+    <p id="archived-banner" class="banner" hidden>
+      This board is archived.
+      <button type="button" id="unarchive-btn" class="btn">Unarchive</button>
+    </p>
+    <p id="page-error" class="page-error" role="alert"></p>
+  </header>
+
+  <div class="board-wrap">
+    <main id="board" class="board" aria-label="Kanban board"></main>
+    <form id="add-column-form" class="add-column">
+      <h2>New column</h2>
+      <input id="new-column-name" type="text" maxlength="80" placeholder="Column name" aria-label="New column name" autocomplete="off">
+      <button type="submit" class="btn">Add</button>
+    </form>
+  </div>
+
+  <section id="archived-strip" class="archived-strip" hidden>
+    <h2>Archived</h2>
+    <ul id="archived-list" class="card-list"></ul>
+  </section>
+
+  <footer class="site-footer">
+    <p id="connection-status" class="connection-status" data-state="connecting">Connecting…</p>
+  </footer>
+
+  <script type="module" src="/js/board.js"></script>
+</body>
+</html>

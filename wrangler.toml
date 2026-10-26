@@ -29,4 +29,6 @@ new_sqlite_classes = ["CatalogDO"]
 [assets]
 directory = "app"
 binding = "ASSETS"
-not_found_handling = "single-page-application"
+not_found_handling = "404-page"
+# Unknown paths would otherwise be served as index.html before this Worker runs.
+run_worker_first = true

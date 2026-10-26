@@ -1,172 +1,619 @@
-import { API } from "./config.js";
-import { JOB_STATUSES } from "./constants.js";
-import { connectYjsRoom } from "./yjs-sync.js";
+/** Board view. Columns come from the board document. The socket is read-only;
+ * every change is an HTTP request, and the next server update redraws the board.
+ */
+
+import { API, readRouteIds, requestJson, stillExists } from "./config.js";
+import { connectYjsRoom, setStatus } from "./yjs-sync.js";
+
+const NAME_MAX = 80;
+const TITLE_MAX = 200;
+
+const { boardId } = readRouteIds();
 
 const statusEl = document.getElementById("connection-status");
-const newJobBtn = document.getElementById("new-job-btn");
-
-const columns = new Map(
-  [...document.querySelectorAll(".board-column")].map((col) => [
-    col.dataset.status,
-    col.querySelector("[data-dropzone]"),
-  ]),
-);
+const boardEl = document.getElementById("board");
+const boardNameEl = document.getElementById("board-name");
+const archivedBanner = document.getElementById("archived-banner");
+const unarchiveBtn = document.getElementById("unarchive-btn");
+const archivedStrip = document.getElementById("archived-strip");
+const archivedList = document.getElementById("archived-list");
+const addColumnForm = document.getElementById("add-column-form");
+const newColumnInput = document.getElementById("new-column-name");
+const errorEl = document.getElementById("page-error");
 
 let doc = null;
+let missing = false;
 let rendering = false;
+let renderPending = false;
+let dragCardId = null;
+let suppressClick = false;
+const adding = new Set();
 
-async function bootstrap() {
-  const room = connectYjsRoom(API.boardWs);
-  room.bindStatus(statusEl);
-
-  try {
-    doc = await room.ready;
-    renderFromDoc();
-    observeDoc();
-  } catch (err) {
-    console.error(err);
-    setStatus("error", "Could not sync board");
-  }
+function oneLine(value, max) {
+  return value.replace(/[\r\n]+/g, " ").trim().slice(0, max);
 }
 
-function observeDoc() {
-  const cards = doc.getArray("cards");
-  cards.observeDeep(() => {
-    if (!rendering) renderFromDoc();
+function setError(message) {
+  errorEl.textContent = message || "";
+}
+
+function readBoard(source) {
+  const meta = source.getMap("meta");
+  const columns = source
+    .getArray("columns")
+    .toArray()
+    .filter(Boolean)
+    .map((column) => ({
+      id: String(column.id ?? ""),
+      name: String(column.name ?? ""),
+    }))
+    .filter((column) => column.id);
+
+  const cards = [];
+  source.getMap("cards").forEach((value, key) => {
+    if (!value || typeof value.get !== "function") return;
+    cards.push({
+      id: String(value.get("id") ?? key),
+      title: String(value.get("title") ?? ""),
+      columnId: value.get("columnId") ?? null,
+      rank: Number(value.get("rank")) || 0,
+      due: value.get("due") ?? null,
+      assignee: String(value.get("assignee") ?? ""),
+      labels: readLabels(value.get("labels")),
+      archived: value.get("archived") === true,
+    });
   });
+
+  return {
+    name: String(meta.get("name") ?? ""),
+    archived: meta.get("archived") === true,
+    columns,
+    cards,
+  };
+}
+
+function readLabels(value) {
+  if (Array.isArray(value)) return value.map(String);
+  if (value && typeof value.toArray === "function") return value.toArray().map(String);
+  return [];
+}
+
+function compareCards(a, b) {
+  if (a.rank !== b.rank) return a.rank - b.rank;
+  return a.id.localeCompare(b.id);
+}
+
+function columnCards(cards, columnId) {
+  return cards.filter((card) => card.columnId === columnId && !card.archived).sort(compareCards);
+}
+
+function cardHref(cardId) {
+  return `/b/${encodeURIComponent(boardId)}/c/${encodeURIComponent(cardId)}`;
 }
 
 function renderFromDoc() {
+  if (!doc || missing) return;
+  // Replacing the dragged card detaches it, so dragend never reaches us and
+  // clicks stay suppressed. Hold the redraw until the drag finishes.
+  if (dragCardId || rendering) {
+    renderPending = true;
+    return;
+  }
   rendering = true;
-  const cards = doc
-    .getArray("cards")
-    .toArray()
-    .filter(Boolean);
+  renderPending = false;
+  const ui = captureUi();
+  const board = readBoard(doc);
 
-  for (const status of JOB_STATUSES) {
-    columns.get(status)?.replaceChildren();
+  if (document.activeElement !== boardNameEl) {
+    boardNameEl.textContent = board.name || "Untitled board";
   }
+  document.title = `${board.name || "Board"} · Taxis Kanban`;
+  archivedBanner.hidden = !board.archived;
 
-  for (const card of cards) {
-    const list = columns.get(card.status) ?? columns.get("lead");
-    if (!list) continue;
-    list.appendChild(buildCardEl(card));
-  }
-
+  boardEl.replaceChildren(
+    ...board.columns.map((column, index) =>
+      renderColumn(column, columnCards(board.cards, column.id), index, board.columns.length),
+    ),
+  );
+  renderArchived(board.cards.filter((card) => card.archived).sort(compareCards));
+  restoreUi(ui);
   rendering = false;
+  if (renderPending) renderFromDoc();
 }
 
-function buildCardEl(card) {
+function renderColumn(column, cards, index, count) {
+  const section = document.createElement("section");
+  section.className = "board-column";
+  section.dataset.columnId = column.id;
+
+  const head = document.createElement("div");
+  head.className = "column-head";
+
+  const heading = document.createElement("h2");
+  heading.dataset.columnName = "";
+  heading.contentEditable = "plaintext-only";
+  heading.spellcheck = true;
+  heading.setAttribute("aria-label", "Column name");
+  heading.textContent = column.name;
+
+  const actions = document.createElement("div");
+  actions.className = "column-actions";
+  actions.append(
+    iconButton("move-left", "Move column left", "←", index === 0),
+    iconButton("move-right", "Move column right", "→", index === count - 1),
+    iconButton("delete-column", "Delete column", "✕", false),
+  );
+  head.append(heading, actions);
+
+  const list = document.createElement("ul");
+  list.className = "card-list";
+  for (const card of cards) list.append(buildCardEl(card));
+
+  const form = document.createElement("form");
+  form.className = "composer";
+  form.dataset.composer = "";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.maxLength = TITLE_MAX;
+  input.placeholder = "Card title";
+  input.setAttribute("aria-label", `Add a card to ${column.name}`);
+  input.dataset.composerInput = "";
+  input.autocomplete = "off";
+  const add = document.createElement("button");
+  add.type = "submit";
+  add.className = "btn";
+  add.textContent = "Add";
+  form.append(input, add);
+
+  section.append(head, list, form);
+  return section;
+}
+
+function buildCardEl(card, { archived = false } = {}) {
   const li = document.createElement("li");
-  li.dataset.jobId = card.id;
-  li.draggable = true;
+  li.dataset.cardId = card.id;
+  li.draggable = !archived;
 
   const link = document.createElement("a");
-  link.href = `/job?id=${encodeURIComponent(card.id)}`;
-  link.textContent = card.title || card.slug || card.id;
-  li.appendChild(link);
+  link.href = cardHref(card.id);
+  link.draggable = false;
+  link.textContent = card.title || "Untitled";
+  li.append(link);
 
-  if (card.clientName) {
-    const sub = document.createElement("small");
-    sub.textContent = card.clientName;
-    li.appendChild(document.createElement("br"));
-    li.appendChild(sub);
+  const meta = [card.assignee, card.due].filter(Boolean).join(" · ");
+  if (meta) {
+    const small = document.createElement("small");
+    small.textContent = meta;
+    li.append(small);
   }
 
-  const statusRow = document.createElement("label");
-  statusRow.className = "card-status";
-  statusRow.append("Status: ");
-
-  const select = document.createElement("select");
-  for (const s of JOB_STATUSES) {
-    const opt = document.createElement("option");
-    opt.value = s;
-    opt.textContent = s;
-    if (s === card.status) opt.selected = true;
-    select.appendChild(opt);
+  if (card.labels.length) {
+    const chips = document.createElement("ul");
+    chips.className = "card-labels";
+    for (const label of card.labels) {
+      const chip = document.createElement("li");
+      chip.className = "label-chip";
+      chip.textContent = label;
+      chips.append(chip);
+    }
+    li.append(chips);
   }
-  select.addEventListener("change", () => moveCard(card.id, select.value));
-  statusRow.appendChild(select);
-  li.appendChild(statusRow);
 
-  li.addEventListener("dragstart", (e) => {
-    e.dataTransfer.setData("text/plain", card.id);
-    li.classList.add("dragging");
-  });
-  li.addEventListener("dragend", () => li.classList.remove("dragging"));
+  if (archived) {
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "btn";
+    restore.dataset.action = "restore";
+    restore.dataset.cardId = card.id;
+    restore.textContent = "Restore";
+    li.append(restore);
+  }
 
   return li;
 }
 
-function moveCard(jobId, newStatus) {
-  const cards = doc.getArray("cards");
-  const items = cards.toArray();
-  const idx = items.findIndex((c) => c.id === jobId);
-  if (idx < 0) return;
+function renderArchived(cards) {
+  archivedStrip.hidden = cards.length === 0;
+  archivedList.replaceChildren(...cards.map((card) => buildCardEl(card, { archived: true })));
+}
 
-  if (items[idx].status === newStatus) return;
+function captureUi() {
+  const active = document.activeElement;
+  const composer = new Map();
+  for (const input of boardEl.querySelectorAll("[data-composer-input]")) {
+    const columnId = input.closest("[data-column-id]")?.dataset.columnId;
+    if (!columnId) continue;
+    if (!input.value && active !== input) continue;
+    composer.set(columnId, {
+      value: input.value,
+      focus: active === input,
+      start: input.selectionStart,
+      end: input.selectionEnd,
+    });
+  }
 
-  // Optimistic local move for instant feedback.
-  const updated = {
-    ...items[idx],
-    status: newStatus,
-    updatedAt: new Date().toISOString(),
-  };
-  doc.transact(() => {
-    cards.delete(idx, 1);
-    cards.insert(idx, [updated]);
+  let columnName = null;
+  if (active?.matches?.("[data-column-name]") && boardEl.contains(active)) {
+    columnName = {
+      id: active.closest("[data-column-id]")?.dataset.columnId,
+      value: active.textContent ?? "",
+      offset: caretOffset(active),
+    };
+  }
+
+  return { composer, columnName };
+}
+
+function caretOffset(el) {
+  const selection = document.getSelection();
+  if (!selection || !selection.anchorNode || !el.contains(selection.anchorNode)) return null;
+  if (selection.anchorNode === el) return null;
+  return selection.anchorOffset;
+}
+
+function restoreUi(ui) {
+  if (ui.columnName?.id) {
+    const heading = boardEl.querySelector(
+      `[data-column-id="${CSS.escape(ui.columnName.id)}"] [data-column-name]`,
+    );
+    if (heading) {
+      heading.textContent = ui.columnName.value;
+      focusEditable(heading, ui.columnName.offset);
+    }
+  }
+
+  for (const [columnId, composer] of ui.composer) {
+    const input = boardEl.querySelector(
+      `[data-column-id="${CSS.escape(columnId)}"] [data-composer-input]`,
+    );
+    if (!input) continue;
+    input.value = composer.value;
+    if (!composer.focus) continue;
+    input.focus();
+    const start = composer.start ?? input.value.length;
+    input.setSelectionRange(start, composer.end ?? start);
+  }
+}
+
+function focusEditable(el, offset) {
+  el.focus();
+  const text = el.firstChild;
+  if (!text || text.nodeType !== Node.TEXT_NODE) return;
+  const point = Math.min(offset ?? text.length, text.length);
+  const range = document.createRange();
+  range.setStart(text, point);
+  range.collapse(true);
+  const selection = document.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
+function iconButton(action, label, text, disabled) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.action = action;
+  button.setAttribute("aria-label", label);
+  button.textContent = text;
+  button.disabled = disabled;
+  return button;
+}
+
+function clearDragOver() {
+  boardEl.querySelectorAll(".drag-over, .dragging").forEach((el) => {
+    el.classList.remove("drag-over", "dragging");
   });
-
-  // Report to the JobDO (source of truth); it echoes the card back to the board.
-  fetch(API.jobStatus(jobId), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status: newStatus }),
-  }).catch((err) => console.error("Status update failed", err));
 }
 
-function setupDropZones() {
-  for (const [status, list] of columns) {
-    list.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      list.classList.add("drag-over");
-    });
-    list.addEventListener("dragleave", () => list.classList.remove("drag-over"));
-    list.addEventListener("drop", (e) => {
-      e.preventDefault();
-      list.classList.remove("drag-over");
-      const jobId = e.dataTransfer.getData("text/plain");
-      if (jobId) moveCard(jobId, status);
-    });
-  }
+function isNoopMove(cardId, columnId, beforeId) {
+  const board = readBoard(doc);
+  const card = board.cards.find((item) => item.id === cardId);
+  if (!card || card.columnId !== columnId || card.archived) return false;
+  const ids = columnCards(board.cards, columnId).map((item) => item.id);
+  const index = ids.indexOf(cardId);
+  if (index < 0) return false;
+  if (beforeId) return ids[index + 1] === beforeId;
+  return index === ids.length - 1;
 }
 
-async function createJob() {
-  const title = window.prompt("Job title:");
-  if (!title?.trim()) return;
-
-  newJobBtn.disabled = true;
+async function moveCard(cardId, columnId, beforeId) {
+  if (!doc || !cardId || !columnId || beforeId === cardId) return;
+  if (isNoopMove(cardId, columnId, beforeId)) return;
+  setError("");
   try {
-    const res = await fetch(API.createJob, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: title.trim() }),
-    });
-    if (!res.ok) throw new Error(`Create failed (${res.status})`);
-    // Board card arrives via Yjs broadcast from BoardDO.
+    const body = { columnId };
+    if (beforeId) body.beforeId = beforeId;
+    await requestJson(API.cardMove(boardId, cardId), { method: "POST", body });
   } catch (err) {
-    console.error(err);
-    window.alert("Could not create job.");
-  } finally {
-    newJobBtn.disabled = false;
+    setError(err.message);
   }
 }
 
-function setStatus(state, label) {
-  statusEl.dataset.state = state;
-  statusEl.textContent = label;
+async function shiftColumn(columnId, direction) {
+  const ids = doc.getArray("columns").toArray().map((column) => column.id);
+  const index = ids.indexOf(columnId);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= ids.length) return;
+  const next = [...ids];
+  const [moved] = next.splice(index, 1);
+  next.splice(target, 0, moved);
+  setError("");
+  try {
+    await requestJson(API.columnOrder(boardId), { method: "POST", body: { ids: next } });
+  } catch (err) {
+    setError(err.message);
+  }
 }
 
-newJobBtn?.addEventListener("click", createJob);
-setupDropZones();
+async function removeColumn(columnId) {
+  setError("");
+  try {
+    await requestJson(API.column(boardId, columnId), { method: "DELETE" });
+  } catch (err) {
+    setError(err.message);
+  }
+}
+
+async function commitColumnName(heading) {
+  if (rendering || !doc) return;
+  const columnId = heading.closest("[data-column-id]")?.dataset.columnId;
+  if (!columnId) return;
+  const current = doc.getArray("columns").toArray().find((column) => column?.id === columnId);
+  if (!current) return;
+  const name = oneLine(heading.textContent ?? "", NAME_MAX);
+  if (!name || name === current.name) {
+    if (!name) heading.textContent = current.name;
+    return;
+  }
+  setError("");
+  try {
+    await requestJson(API.column(boardId, columnId), { method: "PATCH", body: { name } });
+  } catch (err) {
+    setError(err.message);
+    if (heading.isConnected) heading.textContent = current.name;
+  }
+}
+
+async function commitBoardName() {
+  if (rendering || !doc) return;
+  const current = String(doc.getMap("meta").get("name") ?? "");
+  const name = oneLine(boardNameEl.textContent ?? "", NAME_MAX);
+  if (!name || name === current) {
+    if (!name) boardNameEl.textContent = current || "Untitled board";
+    return;
+  }
+  setError("");
+  try {
+    await requestJson(API.board(boardId), { method: "PATCH", body: { name } });
+  } catch (err) {
+    setError(err.message);
+    boardNameEl.textContent = current || "Untitled board";
+  }
+}
+
+async function addCard(columnId, input) {
+  const title = oneLine(input.value, TITLE_MAX);
+  if (!title) {
+    input.value = "";
+    return;
+  }
+  if (adding.has(columnId)) return;
+  adding.add(columnId);
+  input.value = "";
+  setError("");
+  try {
+    await requestJson(API.cards(boardId), {
+      method: "POST",
+      body: { title, columnId },
+    });
+  } catch (err) {
+    setError(err.message);
+    const live = boardEl.querySelector(
+      `[data-column-id="${CSS.escape(columnId)}"] [data-composer-input]`,
+    );
+    if (live && !live.value) live.value = title;
+    else if (!input.value) input.value = title;
+  } finally {
+    adding.delete(columnId);
+  }
+}
+
+function showMissing() {
+  missing = true;
+  renderPending = false;
+  boardNameEl.textContent = "Board not found";
+  boardNameEl.removeAttribute("contenteditable");
+  addColumnForm.hidden = true;
+  boardEl.replaceChildren();
+  archivedStrip.hidden = true;
+  setStatus(statusEl, "error", "Board not found");
+}
+
+function finishDrag() {
+  if (!dragCardId && !suppressClick) return;
+  dragCardId = null;
+  clearDragOver();
+  // The click that follows a drop is not a navigation.
+  setTimeout(() => {
+    suppressClick = false;
+  }, 0);
+  if (renderPending) renderFromDoc();
+}
+
+function dropBeforeId(column, event) {
+  const overCard = event.target.closest?.("[data-card-id]");
+  if (!overCard || !column.contains(overCard)) return null;
+  const rect = overCard.getBoundingClientRect();
+  const lowerHalf = event.clientY >= rect.top + rect.height / 2;
+  if (!lowerHalf) return overCard.dataset.cardId;
+  return overCard.nextElementSibling?.dataset.cardId ?? null;
+}
+
+boardEl.addEventListener("click", (event) => {
+  if (suppressClick) {
+    event.preventDefault();
+    return;
+  }
+  const button = event.target.closest("[data-action]");
+  if (!button || !boardEl.contains(button)) return;
+  const columnId = button.closest("[data-column-id]")?.dataset.columnId;
+  if (!columnId) return;
+  if (button.dataset.action === "move-left") void shiftColumn(columnId, -1);
+  else if (button.dataset.action === "move-right") void shiftColumn(columnId, 1);
+  else if (button.dataset.action === "delete-column") void removeColumn(columnId);
+});
+
+boardEl.addEventListener("submit", (event) => {
+  const form = event.target.closest?.("[data-composer]");
+  if (!form || !boardEl.contains(form)) return;
+  event.preventDefault();
+  const columnId = form.closest("[data-column-id]")?.dataset.columnId;
+  const input = form.querySelector("[data-composer-input]");
+  if (!columnId || !input) return;
+  void addCard(columnId, input);
+});
+
+boardEl.addEventListener("focusout", (event) => {
+  const heading = event.target.closest?.("[data-column-name]");
+  if (!heading || !boardEl.contains(heading)) return;
+  void commitColumnName(heading);
+});
+
+boardEl.addEventListener("keydown", (event) => {
+  if (!event.target.matches?.("[data-column-name]")) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    event.target.blur();
+  } else if (event.key === "Escape") {
+    const columnId = event.target.closest("[data-column-id]")?.dataset.columnId;
+    const current = doc?.getArray("columns").toArray().find((column) => column?.id === columnId);
+    if (current) event.target.textContent = current.name;
+    event.preventDefault();
+    event.target.blur();
+  }
+});
+
+boardEl.addEventListener("dragstart", (event) => {
+  const item = event.target.closest?.("[data-card-id]");
+  if (!item || !boardEl.contains(item) || !item.draggable) return;
+  dragCardId = item.dataset.cardId;
+  suppressClick = true;
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", dragCardId);
+  item.classList.add("dragging");
+  item.addEventListener("dragend", finishDrag, { once: true });
+});
+
+boardEl.addEventListener("dragover", (event) => {
+  const column = event.target.closest?.("[data-column-id]");
+  if (!column || !boardEl.contains(column)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+  for (const el of boardEl.querySelectorAll(".drag-over")) {
+    if (el !== column) el.classList.remove("drag-over");
+  }
+  column.classList.add("drag-over");
+});
+
+boardEl.addEventListener("drop", (event) => {
+  const column = event.target.closest?.("[data-column-id]");
+  if (!column || !boardEl.contains(column)) return;
+  event.preventDefault();
+  clearDragOver();
+  const cardId = dragCardId || event.dataTransfer.getData("text/plain");
+  const beforeId = dropBeforeId(column, event);
+  void moveCard(cardId, column.dataset.columnId, beforeId);
+});
+
+document.addEventListener("dragend", finishDrag);
+
+archivedList.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-action='restore']");
+  if (!button) return;
+  const cardId = button.dataset.cardId;
+  button.disabled = true;
+  setError("");
+  void requestJson(API.cardArchive(boardId, cardId), {
+    method: "POST",
+    body: { archived: false },
+  }).catch((err) => {
+    button.disabled = false;
+    setError(err.message);
+  });
+});
+
+boardNameEl.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    boardNameEl.blur();
+  } else if (event.key === "Escape" && doc) {
+    boardNameEl.textContent = String(doc.getMap("meta").get("name") ?? "");
+    event.preventDefault();
+    boardNameEl.blur();
+  }
+});
+
+boardNameEl.addEventListener("blur", () => {
+  void commitBoardName();
+});
+
+unarchiveBtn.addEventListener("click", async () => {
+  unarchiveBtn.disabled = true;
+  setError("");
+  try {
+    await requestJson(API.board(boardId), { method: "PATCH", body: { archived: false } });
+  } catch (err) {
+    setError(err.message);
+  } finally {
+    unarchiveBtn.disabled = false;
+  }
+});
+
+addColumnForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = oneLine(newColumnInput.value, NAME_MAX);
+  if (!name) {
+    newColumnInput.value = "";
+    return;
+  }
+  const button = addColumnForm.querySelector("button");
+  button.disabled = true;
+  setError("");
+  try {
+    await requestJson(API.columns(boardId), { method: "POST", body: { name } });
+    newColumnInput.value = "";
+  } catch (err) {
+    setError(err.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+async function bootstrap() {
+  if (!boardId) {
+    showMissing();
+    return;
+  }
+
+  try {
+    await requestJson(API.boardSnapshot(boardId));
+  } catch (err) {
+    if (err.status === 404) {
+      showMissing();
+      return;
+    }
+    setError(err.message);
+  }
+
+  const room = connectYjsRoom(API.boardWs(boardId), {
+    stillThere: () => stillExists(API.boardSnapshot(boardId)),
+    onMissing: showMissing,
+  });
+  room.bindStatus(statusEl);
+
+  doc = await room.ready;
+  if (!doc) return;
+  renderFromDoc();
+  doc.on("update", renderFromDoc);
+}
+
 bootstrap();

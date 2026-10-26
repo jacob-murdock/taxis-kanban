@@ -9,51 +9,29 @@
 </head>
 <body>
   <header class="site-header">
-    <div class="header-row">
-      <div>
-        <h1>Taxis Kanban</h1>
-        <p class="tagline">Active jobs board</p>
-      </div>
-      <button type="button" id="new-job-btn" class="btn-primary">+ New job</button>
-    </div>
+    <h1>Taxis Kanban</h1>
+    <p class="tagline">Boards</p>
+    <p id="page-error" class="page-error" role="alert"></p>
   </header>
 
-  <main id="board" class="board" aria-label="Kanban board">
-    <!-- Columns populated by board.js — lifecycle: lead → scoped → active → review → done → invoiced → paid -->
-    <section class="board-column" data-status="lead">
-      <h2>Lead</h2>
-      <ul class="card-list" data-dropzone></ul>
-    </section>
-    <section class="board-column" data-status="scoped">
-      <h2>Scoped</h2>
-      <ul class="card-list" data-dropzone></ul>
-    </section>
-    <section class="board-column" data-status="active">
-      <h2>Active</h2>
-      <ul class="card-list" data-dropzone></ul>
-    </section>
-    <section class="board-column" data-status="review">
-      <h2>Review</h2>
-      <ul class="card-list" data-dropzone></ul>
-    </section>
-    <section class="board-column" data-status="done">
-      <h2>Done</h2>
-      <ul class="card-list" data-dropzone></ul>
-    </section>
-    <section class="board-column" data-status="invoiced">
-      <h2>Invoiced</h2>
-      <ul class="card-list" data-dropzone></ul>
-    </section>
-    <section class="board-column" data-status="paid">
-      <h2>Paid</h2>
-      <ul class="card-list" data-dropzone></ul>
-    </section>
+  <main class="stack">
+    <form id="create-board-form" class="create-board">
+      <input id="new-board-name" type="text" name="name" maxlength="80" required placeholder="Board name" aria-label="Board name" autocomplete="off">
+      <button type="submit" class="btn-primary">Create</button>
+    </form>
+    <label class="show-archived">
+      <input id="show-archived" type="checkbox">
+      Show archived
+    </label>
+    <ul id="board-list" class="board-list">
+      <li class="placeholder">Loading…</li>
+    </ul>
   </main>
 
   <footer class="site-footer">
     <p id="connection-status" class="connection-status" data-state="connecting">Connecting…</p>
   </footer>
 
-  <script type="module" src="/js/board.js"></script>
+  <script type="module" src="/js/boards.js"></script>
 </body>
 </html>

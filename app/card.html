@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Card · Taxis Kanban</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <header class="site-header">
+    <nav><a id="back-link" href="/">← Board</a></nav>
+    <h1 id="card-title" contenteditable="plaintext-only" spellcheck="true" aria-label="Card title">Loading…</h1>
+    <p id="card-meta" class="card-meta muted"></p>
+    <p id="page-error" class="page-error" role="alert"></p>
+  </header>
+
+  <main class="card-page">
+    <aside class="card-fields">
+      <dl>
+        <dt><label for="field-column">Column</label></dt>
+        <dd>
+          <select id="field-column"></select>
+        </dd>
+
+        <dt><label for="field-assignee">Assignee</label></dt>
+        <dd>
+          <input id="field-assignee" type="text" maxlength="80" placeholder="Name" autocomplete="off">
+        </dd>
+
+        <dt><label for="field-due">Due</label></dt>
+        <dd>
+          <input id="field-due" type="date">
+        </dd>
+
+        <dt><label for="field-label">Labels</label></dt>
+        <dd>
+          <ul id="label-list" class="label-list"></ul>
+          <form id="label-form" class="label-form">
+            <input id="field-label" type="text" maxlength="30" placeholder="Add a label" autocomplete="off">
+          </form>
+        </dd>
+      </dl>
+      <div class="card-actions">
+        <button type="button" id="archive-btn" class="btn">Archive</button>
+        <button type="button" id="delete-btn" class="btn">Delete</button>
+      </div>
+    </aside>
+
+    <article class="card-notes">
+      <h2><label for="card-body">Notes</label></h2>
+      <textarea id="card-body" class="markdown-body" rows="16" placeholder="Markdown notes…"></textarea>
+    </article>
+
+    <aside class="card-history">
+      <h2>Recent changes</h2>
+      <ol id="history-list" class="history-list">
+        <li class="placeholder">No changes yet.</li>
+      </ol>
+    </aside>
+  </main>
+
+  <footer class="site-footer">
+    <p id="connection-status" class="connection-status" data-state="connecting">Connecting…</p>
+  </footer>
+
+  <script type="module" src="/js/card.js"></script>
+</body>
+</html>
