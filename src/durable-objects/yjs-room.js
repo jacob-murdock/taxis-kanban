@@ -11,12 +11,20 @@ export class YjsRoom extends DurableObject {
   constructor(ctx, env, options = {}) {
     super(ctx, env);
     this.doc = null;
+    this.docReady = null;
     this.options = options;
   }
 
-  async ensureDoc() {
-    if (this.doc) return this.doc;
+  /** Load the doc once; concurrent callers share the same promise. */
+  ensureDoc() {
+    this.docReady ??= this.loadDoc().catch((err) => {
+      this.docReady = null;
+      throw err;
+    });
+    return this.docReady;
+  }
 
+  async loadDoc() {
     const storedState = await this.ctx.storage.get(STORAGE_KEY_STATE);
 
     this.doc = new Y.Doc();
