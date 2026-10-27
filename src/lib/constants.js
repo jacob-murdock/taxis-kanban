@@ -1,6 +1,12 @@
 /** Debounce window before materializing a card snapshot into DO storage. */
 export const SNAPSHOT_ALARM_MS = 300_000;
 
+/** Fold the Yjs update log into one snapshot once it reaches this many rows. */
+export const YJS_COMPACT_EVERY = 50;
+
+/** Compact a shorter update log after the room has been idle this long. */
+export const YJS_COMPACT_ALARM_MS = 30_000;
+
 export const BOARD_NAME_MAX = 80;
 export const COLUMN_NAME_MAX = 80;
 export const CARD_TITLE_MAX = 200;

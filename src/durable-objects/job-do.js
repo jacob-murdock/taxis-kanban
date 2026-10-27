@@ -14,6 +14,7 @@ import {
 } from "../lib/fields.js";
 
 const CHANGELOG_DEBOUNCE_MS = 400;
+const CARD_SNAPSHOT_ALARM = "card-snapshot";
 
 // Board-card summary fields; columnId and rank are owned by BoardDO placement.
 const SUMMARY_FIELDS = new Set(["title", "due", "assignee", "labels", "archived"]);
@@ -214,12 +215,12 @@ export class JobDO extends YjsRoom {
     this.pendingActor = actor;
 
     const before = this.captureProtected();
+    const update = new Uint8Array(message);
     this.suspendChangelog = true;
     try {
       // Inlined from YjsRoom so the changelog diff is taken before the next
       // await. super.webSocketMessage persists first, and another editor can
       // land inside that gap.
-      const update = new Uint8Array(message);
       Y.applyUpdate(this.doc, update, "remote");
       for (const peer of this.ctx.getWebSockets()) {
         if (peer !== ws) peer.send(update);
@@ -229,7 +230,7 @@ export class JobDO extends YjsRoom {
       this.suspendChangelog = false;
     }
 
-    const persisted = this.persistState();
+    const persisted = this.appendUpdate(update);
     const logged = this.flushChangelog(actor);
     await logged;
     await persisted;
@@ -428,18 +429,22 @@ export class JobDO extends YjsRoom {
   }
 
   async scheduleSnapshotAlarm() {
-    const when = Date.now() + SNAPSHOT_ALARM_MS;
-    const existing = await this.ctx.storage.getAlarm();
-    if (existing === null || existing > when) {
-      await this.ctx.storage.setAlarm(when);
-    }
+    await this.scheduleRoomAlarm(CARD_SNAPSHOT_ALARM, Date.now() + SNAPSHOT_ALARM_MS);
   }
 
   async alarm() {
-    if (await this.isTombstoned() || !(await this.isReady())) return;
+    const due = await super.alarm();
+    if (!due.includes(CARD_SNAPSHOT_ALARM)) return;
+    if (await this.isTombstoned() || !(await this.isReady())) {
+      this.clearRoomAlarm(CARD_SNAPSHOT_ALARM);
+      await this.syncAlarmClock();
+      return;
+    }
     await this.ensureDoc();
     const snapshot = materializeCard(this.doc);
     await this.ctx.storage.put("snapshot:latest", snapshot);
+    this.clearRoomAlarm(CARD_SNAPSHOT_ALARM);
+    await this.syncAlarmClock();
     console.log(`Card ${snapshot.id} snapshot materialized`);
   }
 
