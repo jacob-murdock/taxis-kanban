@@ -127,6 +127,122 @@ textarea {
   padding: 0 1.5rem 1.5rem;
 }
 
+.auth-panel {
+  margin: 0.75rem 0 0;
+}
+
+.auth-form,
+.auth-session {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: 40rem;
+}
+
+.auth-form input[type="email"] {
+  flex: 1;
+  min-width: 12rem;
+}
+
+.auth-email {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.auth-hint {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.auth-confirm .btn-primary {
+  margin-top: 0.75rem;
+}
+
+.board-access {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0 0;
+}
+
+.board-role {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.members-panel {
+  max-width: 40rem;
+  padding: 0 1.5rem 1.5rem;
+}
+
+.members-panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.members-list {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0;
+}
+
+.member-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.member-email {
+  flex: 1;
+  min-width: 10rem;
+  overflow-wrap: anywhere;
+  font-size: 0.875rem;
+}
+
+.invite-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+}
+
+.invite-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.invite-link-row input {
+  flex: 1;
+  min-width: 12rem;
+}
+
+.invite-panel .btn-primary {
+  margin-top: 0.75rem;
+}
+
+body.view-only .composer,
+body.view-only .add-column,
+body.view-only .column-actions {
+  display: none;
+}
+
+body.view-only .board-column [data-column-name],
+body.view-only #board-name {
+  cursor: default;
+}
+
+
 .create-board {
   display: flex;
   gap: 0.5rem;

@@ -1,7 +1,8 @@
+import * as Y from "yjs";
 import { YjsRoom } from "./yjs-room.js";
 import { createEmptyCardDoc, materializeCard } from "../lib/materialize.js";
 import { diffCardSnapshots } from "../lib/changelog.js";
-import { SNAPSHOT_ALARM_MS } from "../lib/constants.js";
+import { ROLE_RANK, SNAPSHOT_ALARM_MS } from "../lib/constants.js";
 import { readJson } from "../lib/json.js";
 import {
   clampLabels,
@@ -26,6 +27,13 @@ export class JobDO extends YjsRoom {
     this.lastSnapshot = null;
     this.changelogTimer = null;
     this.suspendChangelog = false;
+    /** Email for the in-flight debounce batch (flushed when the actor changes). */
+    this.pendingActor = null;
+  }
+
+  readActor(request) {
+    const email = request.headers.get("X-TK-Actor");
+    return email && email.trim() ? email.trim() : "system";
   }
 
   async ensureDoc() {
@@ -53,7 +61,7 @@ export class JobDO extends YjsRoom {
   wireChangelog(doc) {
     const onChange = () => {
       if (this.suspendChangelog) return;
-      this.scheduleChangelog();
+      this.scheduleChangelog(this.pendingActor);
       void this.scheduleSnapshotAlarm();
     };
     doc.getMap("fields").observeDeep(onChange);
@@ -61,34 +69,52 @@ export class JobDO extends YjsRoom {
     doc.getText("body").observe(onChange);
   }
 
-  scheduleChangelog() {
+  /**
+   * Debounce changelog writes for one actor. Callers flush a different actor
+   * before applying that person's edit. The timer closes over `nextActor` so a
+   * later request cannot relabel this batch.
+   */
+  scheduleChangelog(actor) {
+    const nextActor = actor || this.pendingActor || "system";
+    this.pendingActor = nextActor;
     if (this.changelogTimer) clearTimeout(this.changelogTimer);
     this.changelogTimer = setTimeout(() => {
       this.changelogTimer = null;
-      void this.flushChangelog();
+      void this.flushChangelog(nextActor);
     }, CHANGELOG_DEBOUNCE_MS);
   }
 
-  async flushChangelog() {
-    if (this.suspendChangelog || !this.doc || !this.lastSnapshot) return;
-    if (await this.isTombstoned()) return;
+  /** Flush a debounced batch when `nextActor` is about to write as someone else. */
+  async flushPendingActor(nextActor) {
+    if (!this.changelogTimer || !this.pendingActor || this.pendingActor === nextActor) return;
+    const previous = this.pendingActor;
+    clearTimeout(this.changelogTimer);
+    this.changelogTimer = null;
+    await this.flushChangelog(previous);
+  }
 
+  async flushChangelog(author) {
+    if (this.suspendChangelog || !this.doc || !this.lastSnapshot) return;
+    // Capture before the first await. A Durable Object can run another request
+    // at that await, and this batch must keep the actor it already belongs to.
+    const credited = author || this.pendingActor || "system";
     const next = materializeCard(this.doc);
     const changes = diffCardSnapshots(this.lastSnapshot, next);
     if (changes.length === 0) return;
     this.lastSnapshot = next;
 
-    await this.recordChanges(changes);
+    if (await this.isTombstoned()) return;
+    await this.recordChanges(changes, credited);
 
     if (changes.some((c) => SUMMARY_FIELDS.has(c.field))) {
       await this.syncCardToBoard(next);
     }
   }
 
-  async recordChanges(changes) {
+  async recordChanges(changes, author = "system") {
     for (const change of changes) {
       await this.appendChangelog({
-        author: "editor",
+        author,
         field: change.field,
         prev: change.prev,
         next: change.next,
@@ -129,6 +155,10 @@ export class JobDO extends YjsRoom {
   async fetch(request) {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    if (request.method === "POST" && path.endsWith("/revoke-sockets")) {
+      return super.fetch(request);
+    }
 
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       const gate = await this.requireReady();
@@ -172,19 +202,37 @@ export class JobDO extends YjsRoom {
 
   async webSocketMessage(ws, message) {
     if (typeof message === "string") return;
+    const attachment = ws.deserializeAttachment() || {};
+    // Viewers may subscribe but inbound updates are dropped.
+    if ((ROLE_RANK[attachment.role] ?? 0) < ROLE_RANK.editor) return;
     if (await this.isTombstoned()) return;
     if (!(await this.isReady())) return;
 
+    const actor = attachment.email || "system";
+    await this.flushPendingActor(actor);
     await this.ensureDoc();
+    this.pendingActor = actor;
+
     const before = this.captureProtected();
     this.suspendChangelog = true;
     try {
-      await super.webSocketMessage(ws, message);
+      // Inlined from YjsRoom so the changelog diff is taken before the next
+      // await. super.webSocketMessage persists first, and another editor can
+      // land inside that gap.
+      const update = new Uint8Array(message);
+      Y.applyUpdate(this.doc, update, "remote");
+      for (const peer of this.ctx.getWebSockets()) {
+        if (peer !== ws) peer.send(update);
+      }
       this.reconcileRemote(before);
     } finally {
       this.suspendChangelog = false;
     }
-    await this.flushChangelog();
+
+    const persisted = this.persistState();
+    const logged = this.flushChangelog(actor);
+    await logged;
+    await persisted;
   }
 
   captureProtected() {
@@ -267,6 +315,7 @@ export class JobDO extends YjsRoom {
     }
 
     await this.ensureDoc();
+    this.pendingActor = this.readActor(request);
     this.suspendChangelog = true;
     try {
       this.doc.transact(() => {
@@ -280,7 +329,7 @@ export class JobDO extends YjsRoom {
       const next = materializeCard(this.doc);
       const changes = diffCardSnapshots(this.lastSnapshot, next);
       this.lastSnapshot = next;
-      await this.recordChanges(changes);
+      await this.recordChanges(changes, this.pendingActor);
       await this.markReady();
     } finally {
       this.suspendChangelog = false;
@@ -299,10 +348,14 @@ export class JobDO extends YjsRoom {
     const boardCheck = this.requireBoard(body.boardId);
     if (boardCheck) return boardCheck;
 
+    const actor = this.readActor(request);
+    await this.flushPendingActor(actor);
+    this.pendingActor = actor;
+
     this.doc.transact(() => {
       this.doc.getMap("fields").set("columnId", body.columnId);
     });
-    await this.flushChangelog();
+    await this.flushChangelog(actor);
 
     return Response.json({ ok: true });
   }
@@ -317,6 +370,10 @@ export class JobDO extends YjsRoom {
     const boardCheck = this.requireBoard(body.boardId);
     if (boardCheck) return boardCheck;
 
+    const actor = this.readActor(request);
+    await this.flushPendingActor(actor);
+    this.pendingActor = actor;
+
     let next;
     this.suspendChangelog = true;
     try {
@@ -326,7 +383,7 @@ export class JobDO extends YjsRoom {
       next = materializeCard(this.doc);
       const changes = diffCardSnapshots(this.lastSnapshot, next);
       this.lastSnapshot = next;
-      await this.recordChanges(changes);
+      await this.recordChanges(changes, actor);
     } finally {
       this.suspendChangelog = false;
     }

@@ -2,7 +2,7 @@
  * every change is an HTTP request, and the next server update redraws the board.
  */
 
-import { API, readRouteIds, requestJson, stillExists } from "./config.js";
+import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
 
 const NAME_MAX = 80;
@@ -20,6 +20,16 @@ const archivedList = document.getElementById("archived-list");
 const addColumnForm = document.getElementById("add-column-form");
 const newColumnInput = document.getElementById("new-column-name");
 const errorEl = document.getElementById("page-error");
+const boardAccessEl = document.getElementById("board-access");
+const boardRoleEl = document.getElementById("board-role");
+const leaveBoardBtn = document.getElementById("leave-board-btn");
+const membersPanel = document.getElementById("members-panel");
+const membersList = document.getElementById("members-list");
+const inviteForm = document.getElementById("invite-form");
+const inviteRoleEl = document.getElementById("invite-role");
+const inviteLinkRow = document.getElementById("invite-link-row");
+const inviteLinkEl = document.getElementById("invite-link");
+const copyInviteBtn = document.getElementById("copy-invite-btn");
 
 let doc = null;
 let missing = false;
@@ -27,7 +37,17 @@ let rendering = false;
 let renderPending = false;
 let dragCardId = null;
 let suppressClick = false;
+let myRole = null;
+let myEmail = null;
 const adding = new Set();
+
+function canEditBoard() {
+  return myRole === "owner" || myRole === "editor";
+}
+
+function isOwner() {
+  return myRole === "owner";
+}
 
 function oneLine(value, max) {
   return value.replace(/[\r\n]+/g, " ").trim().slice(0, max);
@@ -125,54 +145,64 @@ function renderColumn(column, cards, index, count) {
   const section = document.createElement("section");
   section.className = "board-column";
   section.dataset.columnId = column.id;
+  const editable = canEditBoard();
 
   const head = document.createElement("div");
   head.className = "column-head";
 
   const heading = document.createElement("h2");
   heading.dataset.columnName = "";
-  heading.contentEditable = "plaintext-only";
-  heading.spellcheck = true;
+  if (editable) {
+    heading.contentEditable = "plaintext-only";
+    heading.spellcheck = true;
+  }
   heading.setAttribute("aria-label", "Column name");
   heading.textContent = column.name;
 
-  const actions = document.createElement("div");
-  actions.className = "column-actions";
-  actions.append(
-    iconButton("move-left", "Move column left", "←", index === 0),
-    iconButton("move-right", "Move column right", "→", index === count - 1),
-    iconButton("delete-column", "Delete column", "✕", false),
-  );
-  head.append(heading, actions);
+  head.append(heading);
+  if (editable) {
+    const actions = document.createElement("div");
+    actions.className = "column-actions";
+    actions.append(
+      iconButton("move-left", "Move column left", "←", index === 0),
+      iconButton("move-right", "Move column right", "→", index === count - 1),
+      iconButton("delete-column", "Delete column", "✕", false),
+    );
+    head.append(actions);
+  }
 
   const list = document.createElement("ul");
   list.className = "card-list";
   for (const card of cards) list.append(buildCardEl(card));
 
-  const form = document.createElement("form");
-  form.className = "composer";
-  form.dataset.composer = "";
-  const input = document.createElement("input");
-  input.type = "text";
-  input.maxLength = TITLE_MAX;
-  input.placeholder = "Card title";
-  input.setAttribute("aria-label", `Add a card to ${column.name}`);
-  input.dataset.composerInput = "";
-  input.autocomplete = "off";
-  const add = document.createElement("button");
-  add.type = "submit";
-  add.className = "btn";
-  add.textContent = "Add";
-  form.append(input, add);
+  section.append(head, list);
 
-  section.append(head, list, form);
+  if (editable) {
+    const form = document.createElement("form");
+    form.className = "composer";
+    form.dataset.composer = "";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = TITLE_MAX;
+    input.placeholder = "Card title";
+    input.setAttribute("aria-label", `Add a card to ${column.name}`);
+    input.dataset.composerInput = "";
+    input.autocomplete = "off";
+    const add = document.createElement("button");
+    add.type = "submit";
+    add.className = "btn";
+    add.textContent = "Add";
+    form.append(input, add);
+    section.append(form);
+  }
+
   return section;
 }
 
 function buildCardEl(card, { archived = false } = {}) {
   const li = document.createElement("li");
   li.dataset.cardId = card.id;
-  li.draggable = !archived;
+  li.draggable = canEditBoard() && !archived;
 
   const link = document.createElement("a");
   link.href = cardHref(card.id);
@@ -199,7 +229,7 @@ function buildCardEl(card, { archived = false } = {}) {
     li.append(chips);
   }
 
-  if (archived) {
+  if (archived && canEditBoard()) {
     const restore = document.createElement("button");
     restore.type = "button";
     restore.className = "btn";
@@ -449,6 +479,7 @@ function dropBeforeId(column, event) {
 }
 
 boardEl.addEventListener("click", (event) => {
+  if (!canEditBoard()) return;
   if (suppressClick) {
     event.preventDefault();
     return;
@@ -463,6 +494,7 @@ boardEl.addEventListener("click", (event) => {
 });
 
 boardEl.addEventListener("submit", (event) => {
+  if (!canEditBoard()) return;
   const form = event.target.closest?.("[data-composer]");
   if (!form || !boardEl.contains(form)) return;
   event.preventDefault();
@@ -473,12 +505,14 @@ boardEl.addEventListener("submit", (event) => {
 });
 
 boardEl.addEventListener("focusout", (event) => {
+  if (!canEditBoard()) return;
   const heading = event.target.closest?.("[data-column-name]");
   if (!heading || !boardEl.contains(heading)) return;
   void commitColumnName(heading);
 });
 
 boardEl.addEventListener("keydown", (event) => {
+  if (!canEditBoard()) return;
   if (!event.target.matches?.("[data-column-name]")) return;
   if (event.key === "Enter") {
     event.preventDefault();
@@ -493,6 +527,7 @@ boardEl.addEventListener("keydown", (event) => {
 });
 
 boardEl.addEventListener("dragstart", (event) => {
+  if (!canEditBoard()) return;
   const item = event.target.closest?.("[data-card-id]");
   if (!item || !boardEl.contains(item) || !item.draggable) return;
   dragCardId = item.dataset.cardId;
@@ -504,6 +539,7 @@ boardEl.addEventListener("dragstart", (event) => {
 });
 
 boardEl.addEventListener("dragover", (event) => {
+  if (!canEditBoard()) return;
   const column = event.target.closest?.("[data-column-id]");
   if (!column || !boardEl.contains(column)) return;
   event.preventDefault();
@@ -515,6 +551,7 @@ boardEl.addEventListener("dragover", (event) => {
 });
 
 boardEl.addEventListener("drop", (event) => {
+  if (!canEditBoard()) return;
   const column = event.target.closest?.("[data-column-id]");
   if (!column || !boardEl.contains(column)) return;
   event.preventDefault();
@@ -527,6 +564,7 @@ boardEl.addEventListener("drop", (event) => {
 document.addEventListener("dragend", finishDrag);
 
 archivedList.addEventListener("click", (event) => {
+  if (!canEditBoard()) return;
   const button = event.target.closest("[data-action='restore']");
   if (!button) return;
   const cardId = button.dataset.cardId;
@@ -542,6 +580,7 @@ archivedList.addEventListener("click", (event) => {
 });
 
 boardNameEl.addEventListener("keydown", (event) => {
+  if (!isOwner()) return;
   if (event.key === "Enter") {
     event.preventDefault();
     boardNameEl.blur();
@@ -553,10 +592,12 @@ boardNameEl.addEventListener("keydown", (event) => {
 });
 
 boardNameEl.addEventListener("blur", () => {
+  if (!isOwner()) return;
   void commitBoardName();
 });
 
 unarchiveBtn.addEventListener("click", async () => {
+  if (!isOwner()) return;
   unarchiveBtn.disabled = true;
   setError("");
   try {
@@ -570,6 +611,7 @@ unarchiveBtn.addEventListener("click", async () => {
 
 addColumnForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!canEditBoard()) return;
   const name = oneLine(newColumnInput.value, NAME_MAX);
   if (!name) {
     newColumnInput.value = "";
@@ -588,6 +630,141 @@ addColumnForm.addEventListener("submit", async (event) => {
   }
 });
 
+async function loadMembersPanel() {
+  if (myRole !== "owner") {
+    membersPanel.hidden = true;
+    return;
+  }
+  membersPanel.hidden = false;
+  try {
+    const data = await requestJson(API.boardMembers(boardId));
+    renderMembers(data.members || []);
+  } catch (err) {
+    setError(err.message);
+  }
+}
+
+function renderMembers(members) {
+  membersList.replaceChildren();
+  const ownerCount = members.filter((m) => m.role === "owner").length;
+
+  for (const member of members) {
+    const li = document.createElement("li");
+    li.className = "member-row";
+
+    const email = document.createElement("span");
+    email.className = "member-email";
+    email.textContent = member.email;
+    li.append(email);
+
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", `Role for ${member.email}`);
+    for (const role of ["owner", "editor", "viewer"]) {
+      const option = document.createElement("option");
+      option.value = role;
+      option.textContent = role;
+      if (member.role === role) option.selected = true;
+      select.append(option);
+    }
+    const onlyOwner = member.role === "owner" && ownerCount <= 1;
+    select.disabled = onlyOwner;
+    select.addEventListener("change", () => {
+      void changeMemberRole(member.email, select.value);
+    });
+    li.append(select);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "btn";
+    remove.textContent = member.email === myEmail ? "Leave" : "Remove";
+    remove.disabled = onlyOwner;
+    remove.addEventListener("click", () => {
+      void removeMember(member.email);
+    });
+    li.append(remove);
+
+    membersList.append(li);
+  }
+}
+
+async function changeMemberRole(email, role) {
+  setError("");
+  try {
+    await requestJson(API.boardMember(boardId, email), { method: "PATCH", body: { role } });
+    await loadMembersPanel();
+  } catch (err) {
+    setError(err.message);
+    await loadMembersPanel();
+  }
+}
+
+async function removeMember(email) {
+  setError("");
+  try {
+    await requestJson(API.boardMember(boardId, email), { method: "DELETE" });
+    if (email === myEmail) {
+      location.assign("/");
+      return;
+    }
+    await loadMembersPanel();
+  } catch (err) {
+    setError(err.message);
+  }
+}
+
+function showAccessChrome() {
+  boardAccessEl.hidden = false;
+  boardRoleEl.textContent = myRole ? `Your role: ${myRole}` : "";
+  // Owners leave via the members list (last-owner guard lives there).
+  leaveBoardBtn.hidden = !myRole || myRole === "owner";
+  addColumnForm.hidden = !canEditBoard();
+  document.body.classList.toggle("view-only", myRole === "viewer");
+  if (isOwner()) {
+    boardNameEl.setAttribute("contenteditable", "plaintext-only");
+  } else {
+    boardNameEl.removeAttribute("contenteditable");
+  }
+  unarchiveBtn.hidden = !isOwner();
+}
+
+inviteForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  setError("");
+  const button = inviteForm.querySelector("button[type='submit']");
+  button.disabled = true;
+  try {
+    const created = await requestJson(API.boardInvites(boardId), {
+      method: "POST",
+      body: { role: inviteRoleEl.value },
+    });
+    inviteLinkEl.value = created.url;
+    inviteLinkRow.hidden = false;
+    inviteLinkEl.focus();
+    inviteLinkEl.select();
+  } catch (err) {
+    setError(err.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+copyInviteBtn?.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(inviteLinkEl.value);
+    copyInviteBtn.textContent = "Copied";
+    setTimeout(() => {
+      copyInviteBtn.textContent = "Copy";
+    }, 1500);
+  } catch {
+    inviteLinkEl.select();
+  }
+});
+
+leaveBoardBtn?.addEventListener("click", () => {
+  if (!myEmail) return;
+  void removeMember(myEmail);
+});
+
 async function bootstrap() {
   if (!boardId) {
     showMissing();
@@ -595,9 +772,20 @@ async function bootstrap() {
   }
 
   try {
-    await requestJson(API.boardSnapshot(boardId));
+    const me = await requestJson(API.me);
+    myEmail = me.email;
   } catch (err) {
-    if (err.status === 404) {
+    if (err.status === 401) return;
+    setError(err.message);
+  }
+
+  try {
+    const snapshot = await requestJson(API.boardSnapshot(boardId));
+    myRole = snapshot.role || null;
+    showAccessChrome();
+    void loadMembersPanel();
+  } catch (err) {
+    if (err.status === 404 || err.status === 403) {
       showMissing();
       return;
     }
@@ -607,6 +795,16 @@ async function bootstrap() {
   const room = connectYjsRoom(API.boardWs(boardId), {
     stillThere: () => stillExists(API.boardSnapshot(boardId)),
     onMissing: showMissing,
+    onClose(event) {
+      if (event.code === 4403) {
+        setStatus(statusEl, "error", "Checking access…");
+        void settleRevokedAccess(API.boardSnapshot(boardId)).then((ok) => {
+          if (ok === false) setError("Could not confirm access. Refresh to continue.");
+        });
+        return true;
+      }
+      return false;
+    },
   });
   room.bindStatus(statusEl);
 

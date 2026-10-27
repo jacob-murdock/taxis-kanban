@@ -1,6 +1,6 @@
 /** Card page. Field edits go out on the card socket. Column, archive, and delete use HTTP. */
 
-import { API, readRouteIds, requestJson, stillExists } from "./config.js";
+import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
 import { readCard } from "./card-model.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
 
@@ -35,7 +35,12 @@ let historyTimer = null;
 let columns = [];
 let columnSignature = "";
 let fillingColumn = false;
+let myRole = null;
 const focused = new Set();
+
+function canEditCard() {
+  return myRole === "owner" || myRole === "editor";
+}
 
 function oneLine(value, max) {
   return value.replace(/[\r\n]+/g, " ").trim().slice(0, max);
@@ -52,13 +57,34 @@ function showDeleted() {
 }
 
 function setField(key, value) {
+  if (!canEditCard()) return;
   const fields = doc?.getMap("fields");
   if (!fields || gone || fields.get(key) === value) return;
   doc.transact(() => fields.set(key, value));
 }
 
+function applyViewOnly() {
+  const editable = canEditCard();
+  document.body.classList.toggle("view-only", !editable);
+  if (editable) titleEl.setAttribute("contenteditable", "plaintext-only");
+  else titleEl.removeAttribute("contenteditable");
+  fieldColumn.disabled = !editable;
+  fieldAssignee.disabled = !editable;
+  fieldDue.disabled = !editable;
+  fieldBody.readOnly = !editable;
+  labelForm.hidden = !editable;
+  archiveBtn.hidden = !editable;
+  deleteBtn.hidden = !editable;
+}
+
 async function bootstrap() {
+  applyViewOnly();
   if (boardId) backLink.href = `/b/${encodeURIComponent(boardId)}`;
+  try {
+    await requestJson(API.me);
+  } catch (err) {
+    if (err.status === 401) return;
+  }
   if (!boardId || !cardId) {
     titleEl.textContent = "Card not found";
     setStatus(statusEl, "error", "Missing card");
@@ -66,7 +92,9 @@ async function bootstrap() {
   }
 
   try {
-    await requestJson(API.cardSnapshot(boardId, cardId));
+    const snapshot = await requestJson(API.cardSnapshot(boardId, cardId));
+    myRole = snapshot.role || null;
+    applyViewOnly();
   } catch (err) {
     if (err.status === 404 || err.status === 403) {
       titleEl.textContent = "Card not found";
@@ -81,10 +109,17 @@ async function bootstrap() {
   void loadColumns();
 
   const room = connectYjsRoom(API.cardWs(boardId, cardId), {
-    writable: true,
+    writable: canEditCard(),
     stillThere: () => stillExists(API.cardSnapshot(boardId, cardId)),
     onMissing: showDeleted,
     onClose(event) {
+      if (event.code === 4403) {
+        setStatus(statusEl, "error", "Checking access…");
+        void settleRevokedAccess(API.cardSnapshot(boardId, cardId)).then((ok) => {
+          if (ok === false) setError("Could not confirm access. Refresh to continue.");
+        });
+        return true;
+      }
       if (event.reason !== "deleted") return false;
       showDeleted();
       return true;
@@ -191,12 +226,15 @@ function renderLabels(labels) {
     li.className = "label-chip";
     const text = document.createElement("span");
     text.textContent = label;
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.dataset.labelIndex = String(index);
-    remove.setAttribute("aria-label", `Remove ${label}`);
-    remove.textContent = "×";
-    li.append(text, remove);
+    li.append(text);
+    if (canEditCard()) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.dataset.labelIndex = String(index);
+      remove.setAttribute("aria-label", `Remove ${label}`);
+      remove.textContent = "×";
+      li.append(remove);
+    }
     labelList.append(li);
   });
 }
@@ -217,13 +255,13 @@ function wireEditors() {
   });
 
   titleEl.addEventListener("blur", () => {
-    if (!doc || syncing || gone) return;
+    if (!canEditCard() || !doc || syncing || gone) return;
     setField("title", oneLine(titleEl.textContent ?? "", TITLE_MAX) || "Untitled");
     scheduleHistoryRefresh();
   });
 
   fieldColumn.addEventListener("change", () => {
-    if (!doc || syncing || gone || fillingColumn) return;
+    if (!canEditCard() || !doc || syncing || gone || fillingColumn) return;
     const columnId = fieldColumn.value;
     const current = readCard(doc).columnId;
     if (!columnId || columnId === current) return;
@@ -243,30 +281,30 @@ function wireEditors() {
   });
 
   fieldAssignee.addEventListener("change", () => {
-    if (!doc || syncing || gone) return;
+    if (!canEditCard() || !doc || syncing || gone) return;
     setField("assignee", oneLine(fieldAssignee.value, ASSIGNEE_MAX));
     scheduleHistoryRefresh();
   });
 
   fieldDue.addEventListener("change", () => {
-    if (!doc || syncing || gone) return;
+    if (!canEditCard() || !doc || syncing || gone) return;
     setField("due", fieldDue.value || null);
     scheduleHistoryRefresh();
   });
 
   fieldBody.addEventListener("input", () => {
-    if (!doc || gone) return;
+    if (!canEditCard() || !doc || gone) return;
     applyTextDiff(doc.getText("body"), fieldBody.value);
   });
 
   fieldBody.addEventListener("blur", () => {
-    if (!doc || gone) return;
+    if (!canEditCard() || !doc || gone) return;
     scheduleHistoryRefresh();
   });
 
   labelForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (!doc || gone) return;
+    if (!canEditCard() || !doc || gone) return;
     const label = oneLine(labelInput.value, LABEL_MAX);
     labelInput.value = "";
     if (!label) return;
@@ -282,6 +320,7 @@ function wireEditors() {
   });
 
   labelList.addEventListener("click", (event) => {
+    if (!canEditCard()) return;
     const button = event.target.closest("[data-label-index]");
     if (!button || !doc || gone) return;
     const index = Number(button.dataset.labelIndex);
@@ -292,7 +331,7 @@ function wireEditors() {
   });
 
   archiveBtn.addEventListener("click", async () => {
-    if (!doc || gone) return;
+    if (!canEditCard() || !doc || gone) return;
     const archived = !readCard(doc).archived;
     archiveBtn.disabled = true;
     setError("");
@@ -310,7 +349,7 @@ function wireEditors() {
   });
 
   deleteBtn.addEventListener("click", async () => {
-    if (!doc || gone) return;
+    if (!canEditCard() || !doc || gone) return;
     if (!window.confirm("Delete this card?")) return;
     deleteBtn.disabled = true;
     setError("");
@@ -405,7 +444,8 @@ function renderHistory(entries) {
 
   for (const entry of entries) {
     const li = document.createElement("li");
-    li.textContent = `${entry.ts} — ${entry.field}: ${entry.prev ?? "∅"} → ${entry.next ?? "∅"}`;
+    const author = entry.author ? `${entry.author} · ` : "";
+    li.textContent = `${entry.ts} — ${author}${entry.field}: ${entry.prev ?? "∅"} → ${entry.next ?? "∅"}`;
     historyList.append(li);
   }
 }

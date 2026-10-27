@@ -18,3 +18,21 @@ const UUID =
 export const BOARD_ID_RE = new RegExp(`^board_${UUID}$`, "i");
 export const CARD_ID_RE = new RegExp(`^card_${UUID}$`, "i");
 export const COLUMN_ID_RE = new RegExp(`^col_${UUID}$`, "i");
+
+/** Auth */
+export const SESSION_COOKIE = "tk_session";
+export const SESSION_TTL_SEC = 14 * 24 * 60 * 60;
+export const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
+export const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+export const RATE_LIMIT_EMAIL = 3;
+export const RATE_LIMIT_IP = 10;
+export const EMAIL_MAX = 254;
+export const AUTH_PURGE_ALARM_MS = 24 * 60 * 60 * 1000;
+
+/** Board membership roles (higher rank includes lower). */
+export const ROLE_RANK = { viewer: 1, editor: 2, owner: 3 };
+export const BOARD_ROLES = Object.keys(ROLE_RANK);
+/** Roles that can be granted via invite link (owners are created or promoted separately). */
+export const INVITE_ROLES = ["editor", "viewer"];
+export const WS_CLOSE_REVOKED = 4403;

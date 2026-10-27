@@ -1,0 +1,9 @@
+# Copy to .dev.vars (gitignored) for local `wrangler dev`.
+# Deploy: npx wrangler secret put SESSION_SECRET
+
+SESSION_SECRET=dev-session-secret-change-me
+
+# Optional: real mail via Resend (otherwise magic links are logged to the Worker console).
+# RESEND_API_KEY=
+# MAIL_FROM=Taxis Kanban <noreply@your-domain>
+# APP_URL=http://localhost:8787

@@ -1,5 +1,6 @@
 import * as Y from "yjs";
 import { DurableObject } from "cloudflare:workers";
+import { WS_CLOSE_REVOKED } from "../lib/constants.js";
 
 const STORAGE_KEY_STATE = "ydoc:state";
 const STORAGE_KEY_READY = "ready";
@@ -83,24 +84,58 @@ export class YjsRoom extends DurableObject {
   }
 
   async fetch(request) {
-    if (request.headers.get("Upgrade") === "websocket") {
-      return this.handleWebSocketUpgrade();
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname.endsWith("/revoke-sockets")) {
+      return this.handleRevokeSockets(request);
+    }
+
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      return this.handleWebSocketUpgrade(request);
     }
 
     return new Response("Not found", { status: 404 });
   }
 
-  async handleWebSocketUpgrade() {
+  async handleWebSocketUpgrade(request) {
+    const email = request.headers.get("X-TK-Actor") || "";
+    const role = request.headers.get("X-TK-Role") || "";
+    if (!email || !role) {
+      return Response.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
     await this.ensureDoc();
     this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({ email, role });
 
     const snapshot = Y.encodeStateAsUpdate(this.doc);
     server.send(snapshot);
 
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async handleRevokeSockets(request) {
+    const body = await request.json().catch(() => null);
+    const email = typeof body?.email === "string" ? body.email : "";
+    if (!email) {
+      return Response.json({ error: "email is required" }, { status: 400 });
+    }
+
+    let closed = 0;
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() || {};
+      if (attachment.email === email) {
+        try {
+          ws.close(WS_CLOSE_REVOKED, "revoked");
+          closed += 1;
+        } catch {
+          /* already closing */
+        }
+      }
+    }
+    return Response.json({ ok: true, closed });
   }
 
   async webSocketMessage(ws, message) {

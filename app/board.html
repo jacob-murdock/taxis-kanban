@@ -10,17 +10,40 @@
 <body>
   <header class="site-header">
     <nav><a href="/">← Boards</a></nav>
-    <h1 id="board-name" contenteditable="plaintext-only" spellcheck="true" aria-label="Board name">Loading…</h1>
+    <h1 id="board-name" spellcheck="true" aria-label="Board name">Loading…</h1>
     <p id="archived-banner" class="banner" hidden>
       This board is archived.
       <button type="button" id="unarchive-btn" class="btn">Unarchive</button>
     </p>
     <p id="page-error" class="page-error" role="alert"></p>
+    <div id="board-access" class="board-access" hidden>
+      <p id="board-role" class="board-role"></p>
+      <button type="button" id="leave-board-btn" class="btn" hidden>Leave board</button>
+    </div>
   </header>
+
+  <section id="members-panel" class="members-panel stack" hidden>
+    <h2>Members</h2>
+    <ul id="members-list" class="members-list"></ul>
+    <form id="invite-form" class="invite-form">
+      <label>
+        Invite as
+        <select id="invite-role" aria-label="Invite role">
+          <option value="editor">Editor</option>
+          <option value="viewer">Viewer</option>
+        </select>
+      </label>
+      <button type="submit" class="btn-primary">Create invite link</button>
+    </form>
+    <p id="invite-link-row" class="invite-link-row" hidden>
+      <input id="invite-link" type="text" readonly aria-label="Invite link">
+      <button type="button" id="copy-invite-btn" class="btn">Copy</button>
+    </p>
+  </section>
 
   <div class="board-wrap">
     <main id="board" class="board" aria-label="Kanban board"></main>
-    <form id="add-column-form" class="add-column">
+    <form id="add-column-form" class="add-column" hidden>
       <h2>New column</h2>
       <input id="new-column-name" type="text" maxlength="80" placeholder="Column name" aria-label="New column name" autocomplete="off">
       <button type="submit" class="btn">Add</button>

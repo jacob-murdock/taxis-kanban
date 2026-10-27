@@ -35,6 +35,13 @@ export function connectYjsRoom(url, { writable = false, onClose, stillThere, onM
     resolveReady = resolve;
   });
 
+  if (writable) {
+    doc.on("update", (update, origin) => {
+      if (origin === "remote") return;
+      if (ws?.readyState === WebSocket.OPEN) ws.send(update);
+    });
+  }
+
   function connect() {
     ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
@@ -70,6 +77,12 @@ export function connectYjsRoom(url, { writable = false, onClose, stillThere, onM
 
   async function considerReconnect(event) {
     if (stopped || manualClose) return;
+    if (event?.code === 4403) {
+      stop();
+      setStatus(statusEl, "error", "Access removed");
+      onClose?.(event);
+      return;
+    }
     if (onClose?.(event) === true) {
       stop();
       return;

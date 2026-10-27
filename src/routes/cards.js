@@ -2,13 +2,23 @@ import { CARD_ID_RE, CARD_TITLE_MAX, COLUMN_ID_RE } from "../lib/constants.js";
 import { readJson } from "../lib/json.js";
 import { generateCardId } from "../lib/materialize.js";
 import { safeDecode } from "../lib/path.js";
-import { boardStub, forwardToJob, jobStub, jsonDoRequest, requireUpgrade } from "./do.js";
+import {
+  boardStub,
+  forwardToJob,
+  jobStub,
+  jsonDoRequest,
+  requireRole,
+  requireUpgrade,
+  withCallerRole,
+} from "./do.js";
 
 export async function routeCards(request, env, boardId, rest) {
   const method = request.method;
 
   if (rest === "/cards" && method === "POST") {
-    return createCard(request, env, boardId);
+    const gate = await requireRole(request, env, boardId, "editor");
+    if (gate.error) return gate.error;
+    return createCard(request, env, boardId, gate);
   }
 
   const cardMatch = rest.match(/^\/cards\/([^/]+)(\/.*)?$/);
@@ -26,36 +36,56 @@ export async function routeCards(request, env, boardId, rest) {
 
   const cardRest = cardMatch[2] ?? "";
   if (cardRest === "/move" && method === "POST") {
-    return moveCard(request, env, boardId, cardId);
+    const gate = await requireRole(request, env, boardId, "editor");
+    if (gate.error) return gate.error;
+    return moveCard(request, env, boardId, cardId, gate);
   }
   if (cardRest === "/archive" && method === "POST") {
-    return archiveCard(request, env, boardId, cardId);
+    const gate = await requireRole(request, env, boardId, "editor");
+    if (gate.error) return gate.error;
+    return archiveCard(request, env, boardId, cardId, gate);
   }
   if (cardRest === "" && method === "DELETE") {
-    return deleteCard(env, boardId, cardId);
+    const gate = await requireRole(request, env, boardId, "editor");
+    if (gate.error) return gate.error;
+    return deleteCard(env, boardId, cardId, gate);
   }
   if (cardRest === "/ws") {
     const upgrade = requireUpgrade(request);
     if (upgrade) return upgrade;
+    const gate = await requireRole(request, env, boardId, "viewer");
+    if (gate.error) return gate.error;
     const { error } = await assertCardBoard(env, boardId, cardId);
     if (error) return error;
-    return forwardToJob(env, cardId, request, "/ws", { boardId });
+    return forwardToJob(
+      env,
+      cardId,
+      request,
+      "/ws",
+      { boardId },
+      gate,
+    );
   }
   if (cardRest === "/snapshot" && method === "GET") {
+    const gate = await requireRole(request, env, boardId, "viewer");
+    if (gate.error) return gate.error;
     const { error } = await assertCardBoard(env, boardId, cardId);
     if (error) return error;
-    return forwardToJob(env, cardId, request, "/snapshot");
+    const response = await forwardToJob(env, cardId, request, "/snapshot", null, gate);
+    return withCallerRole(response, gate.role);
   }
   if (cardRest === "/history" && method === "GET") {
+    const gate = await requireRole(request, env, boardId, "viewer");
+    if (gate.error) return gate.error;
     const { error } = await assertCardBoard(env, boardId, cardId);
     if (error) return error;
-    return forwardToJob(env, cardId, request, "/history");
+    return forwardToJob(env, cardId, request, "/history", null, gate);
   }
 
   return Response.json({ error: "Not found" }, { status: 404 });
 }
 
-async function createCard(request, env, boardId) {
+async function createCard(request, env, boardId, gate) {
   const { body, error } = await readJson(request);
   if (error) return error;
 
@@ -91,14 +121,14 @@ async function createCard(request, env, boardId) {
 
   const cardId = generateCardId();
   const initResponse = await jobStub(env, cardId).fetch(
-    jsonDoRequest("/init", "POST", { id: cardId, boardId, title, columnId }),
+    jsonDoRequest("/init", "POST", { id: cardId, boardId, title, columnId }, gate),
   );
   if (!initResponse.ok) {
     return Response.json({ error: "Failed to initialize card" }, { status: 500 });
   }
 
   const insertResponse = await boardStub(env, boardId).fetch(
-    jsonDoRequest("/cards", "POST", { id: cardId, title, columnId }),
+    jsonDoRequest("/cards", "POST", { id: cardId, title, columnId }, gate),
   );
   if (!insertResponse.ok) {
     await jobStub(env, cardId).fetch(new Request("https://do.internal/destroy", { method: "DELETE" }));
@@ -112,7 +142,7 @@ async function createCard(request, env, boardId) {
   );
 }
 
-async function moveCard(request, env, boardId, cardId) {
+async function moveCard(request, env, boardId, cardId, gate) {
   const { body, error } = await readJson(request);
   if (error) return error;
 
@@ -126,15 +156,17 @@ async function moveCard(request, env, boardId, cardId) {
   }
 
   const moveResponse = await boardStub(env, boardId).fetch(
-    jsonDoRequest(`/cards/${cardId}/move`, "POST", {
-      columnId: body.columnId,
-      beforeId: body.beforeId ?? null,
-    }),
+    jsonDoRequest(
+      `/cards/${cardId}/move`,
+      "POST",
+      { columnId: body.columnId, beforeId: body.beforeId ?? null },
+      gate,
+    ),
   );
   if (!moveResponse.ok) return moveResponse;
 
   const columnResponse = await jobStub(env, cardId).fetch(
-    jsonDoRequest("/column", "POST", { boardId, columnId: body.columnId }),
+    jsonDoRequest("/column", "POST", { boardId, columnId: body.columnId }, gate),
   );
   if (!columnResponse.ok) {
     return Response.json({ error: "Failed to update card column" }, { status: 500 });
@@ -143,7 +175,7 @@ async function moveCard(request, env, boardId, cardId) {
   return moveResponse;
 }
 
-async function archiveCard(request, env, boardId, cardId) {
+async function archiveCard(request, env, boardId, cardId, gate) {
   const { body, error } = await readJson(request);
   if (error) return error;
   if (typeof body.archived !== "boolean") {
@@ -151,11 +183,11 @@ async function archiveCard(request, env, boardId, cardId) {
   }
 
   return jobStub(env, cardId).fetch(
-    jsonDoRequest("/archive", "POST", { boardId, archived: body.archived }),
+    jsonDoRequest("/archive", "POST", { boardId, archived: body.archived }, gate),
   );
 }
 
-async function deleteCard(env, boardId, cardId) {
+async function deleteCard(env, boardId, cardId, gate) {
   const { error } = await assertCardBoard(env, boardId, cardId);
   if (error) return error;
 
@@ -167,7 +199,10 @@ async function deleteCard(env, boardId, cardId) {
   }
 
   const jobResponse = await jobStub(env, cardId).fetch(
-    new Request("https://do.internal/destroy", { method: "DELETE" }),
+    new Request("https://do.internal/destroy", {
+      method: "DELETE",
+      headers: gate?.email ? { "X-TK-Actor": gate.email, "X-TK-Role": gate.role } : {},
+    }),
   );
   if (!jobResponse.ok) {
     return Response.json({ error: "Failed to destroy card" }, { status: 500 });

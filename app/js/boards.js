@@ -1,7 +1,7 @@
-/** Board list. The catalog socket is read-only; create, rename, and archive go over HTTP. */
+/** Board list. Catalog is a filtered HTTP snapshot; refresh on focus and after mutations. */
 
-import { API, requestJson } from "./config.js";
-import { connectYjsRoom } from "./yjs-sync.js";
+import { API, requestJson, safeNextPath } from "./config.js";
+import { setStatus } from "./yjs-sync.js";
 
 const NAME_MAX = 80;
 
@@ -10,9 +10,11 @@ const listEl = document.getElementById("board-list");
 const form = document.getElementById("create-board-form");
 const nameInput = document.getElementById("new-board-name");
 const showArchivedEl = document.getElementById("show-archived");
+const archivedToggle = showArchivedEl?.closest(".show-archived");
 const errorEl = document.getElementById("page-error");
 
-let doc = null;
+let boards = [];
+let signedIn = false;
 let rendering = false;
 let editingId = null;
 const pendingBoards = new Map();
@@ -25,33 +27,18 @@ function setError(message) {
   errorEl.textContent = message || "";
 }
 
-function readBoards() {
-  if (!doc) return [];
-  const boards = [];
-  doc.getMap("boards").forEach((value) => {
-    if (!value || typeof value.get !== "function") return;
-    boards.push({
-      id: String(value.get("id") ?? ""),
-      name: String(value.get("name") ?? ""),
-      archived: value.get("archived") === true,
-      createdAt: value.get("createdAt") ?? "",
-    });
-  });
-  return boards;
-}
-
 function visibleBoards() {
-  const boards = readBoards();
-  for (const board of boards) pendingBoards.delete(board.id);
+  const list = boards.map((board) => ({ ...board }));
+  for (const board of list) pendingBoards.delete(board.id);
   for (const board of pendingBoards.values()) {
-    if (!boards.some((item) => item.id === board.id)) boards.push(board);
+    if (!list.some((item) => item.id === board.id)) list.push(board);
   }
-  boards.sort((a, b) => {
+  list.sort((a, b) => {
     const byTime = String(b.createdAt).localeCompare(String(a.createdAt));
     if (byTime) return byTime;
     return a.id.localeCompare(b.id);
   });
-  return boards.filter((board) => showArchivedEl.checked || !board.archived);
+  return list.filter((board) => showArchivedEl.checked || !board.archived);
 }
 
 function render() {
@@ -64,10 +51,19 @@ function render() {
   const selectionStart = draftInput?.selectionStart ?? null;
   const selectionEnd = draftInput?.selectionEnd ?? null;
 
-  const boards = visibleBoards();
+  const visible = visibleBoards();
   listEl.replaceChildren();
 
-  if (!boards.length) {
+  if (!signedIn) {
+    const empty = document.createElement("li");
+    empty.className = "placeholder";
+    empty.textContent = "Sign in to see your boards.";
+    listEl.append(empty);
+    rendering = false;
+    return;
+  }
+
+  if (!visible.length) {
     const empty = document.createElement("li");
     empty.className = "placeholder";
     empty.textContent = showArchivedEl.checked ? "No boards." : "No boards yet.";
@@ -76,7 +72,7 @@ function render() {
     return;
   }
 
-  for (const board of boards) {
+  for (const board of visible) {
     const value = board.id === editingId ? (draft ?? board.name) : null;
     listEl.append(buildRow(board, value));
   }
@@ -97,6 +93,7 @@ function buildRow(board, draft) {
   const li = document.createElement("li");
   li.dataset.boardId = board.id;
   if (board.archived) li.classList.add("is-archived");
+  const isOwner = board.role === "owner";
 
   if (draft != null) {
     const input = document.createElement("input");
@@ -117,20 +114,24 @@ function buildRow(board, draft) {
       tag.textContent = "Archived";
       li.append(tag);
     }
-    const rename = document.createElement("button");
-    rename.type = "button";
-    rename.className = "btn";
-    rename.dataset.action = "rename";
-    rename.textContent = "Rename";
-    li.append(rename);
+    if (isOwner) {
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "btn";
+      rename.dataset.action = "rename";
+      rename.textContent = "Rename";
+      li.append(rename);
+    }
   }
 
-  const archive = document.createElement("button");
-  archive.type = "button";
-  archive.className = "btn";
-  archive.dataset.action = "archive";
-  archive.textContent = board.archived ? "Restore" : "Archive";
-  li.append(archive);
+  if (isOwner || draft != null) {
+    const archive = document.createElement("button");
+    archive.type = "button";
+    archive.className = "btn";
+    archive.dataset.action = "archive";
+    archive.textContent = board.archived ? "Restore" : "Archive";
+    li.append(archive);
+  }
   return li;
 }
 
@@ -143,7 +144,7 @@ function startRename(boardId) {
 }
 
 async function commitRename(boardId, raw) {
-  const current = readBoards().find((board) => board.id === boardId) ?? pendingBoards.get(boardId);
+  const current = boards.find((board) => board.id === boardId) ?? pendingBoards.get(boardId);
   const wasEditing = editingId === boardId;
   if (wasEditing) editingId = null;
   const name = oneLine(raw, NAME_MAX);
@@ -153,13 +154,14 @@ async function commitRename(boardId, raw) {
   setError("");
   try {
     await requestJson(API.board(boardId), { method: "PATCH", body: { name } });
+    await refreshCatalog();
   } catch (err) {
     setError(err.message);
   }
 }
 
 async function toggleArchive(boardId) {
-  const board = readBoards().find((item) => item.id === boardId) ?? pendingBoards.get(boardId);
+  const board = boards.find((item) => item.id === boardId) ?? pendingBoards.get(boardId);
   if (!board) return;
   setError("");
   try {
@@ -167,9 +169,17 @@ async function toggleArchive(boardId) {
       method: "PATCH",
       body: { archived: !board.archived },
     });
+    await refreshCatalog();
   } catch (err) {
     setError(err.message);
   }
+}
+
+async function refreshCatalog() {
+  if (!signedIn) return;
+  const data = await requestJson(API.catalogSnapshot);
+  boards = Array.isArray(data.boards) ? data.boards : [];
+  render();
 }
 
 listEl.addEventListener("mousedown", (event) => {
@@ -229,6 +239,7 @@ listEl.addEventListener("keydown", (event) => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!signedIn) return;
   const name = oneLine(nameInput.value, NAME_MAX);
   if (!name) {
     nameInput.value = "";
@@ -246,8 +257,10 @@ form.addEventListener("submit", async (event) => {
       name: created.name || name,
       archived: false,
       createdAt: new Date().toISOString(),
+      role: created.role || "owner",
     });
     render();
+    await refreshCatalog();
     nameInput.focus();
   } catch (err) {
     setError(err.message);
@@ -257,19 +270,50 @@ form.addEventListener("submit", async (event) => {
 });
 
 showArchivedEl.addEventListener("change", () => {
-  if (doc) render();
+  if (signedIn) render();
 });
 
-async function bootstrap() {
-  const room = connectYjsRoom(API.catalogWs);
-  room.bindStatus(statusEl);
+window.addEventListener("focus", () => {
+  if (signedIn) void refreshCatalog().catch((err) => setError(err.message));
+});
 
-  doc = await room.ready;
-  if (!doc) return;
-  render();
-  doc.on("update", () => {
-    if (!rendering) render();
-  });
+function setListChrome(signedInNow) {
+  form.hidden = !signedInNow;
+  if (archivedToggle) archivedToggle.hidden = !signedInNow;
+}
+
+function consumeNext() {
+  const next = safeNextPath(new URLSearchParams(location.search).get("next"));
+  if (next === "/") return false;
+  location.replace(next);
+  return true;
+}
+
+async function bootstrap() {
+  setListChrome(false);
+  setStatus(statusEl, "connecting", "Checking session…");
+
+  try {
+    await requestJson(API.me);
+  } catch (err) {
+    signedIn = false;
+    setStatus(statusEl, "error", "Sign in to continue");
+    render();
+    if (err.status !== 401) setError(err.message);
+    return;
+  }
+
+  signedIn = true;
+  if (consumeNext()) return;
+  setListChrome(true);
+  try {
+    await refreshCatalog();
+    setStatus(statusEl, "connected", "Signed in");
+  } catch (err) {
+    setStatus(statusEl, "error", "Could not load boards");
+    setError(err.message);
+    render();
+  }
 }
 
 bootstrap();

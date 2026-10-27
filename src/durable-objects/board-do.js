@@ -35,6 +35,10 @@ export class BoardDO extends YjsRoom {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    if (request.method === "POST" && path.endsWith("/revoke-sockets")) {
+      return super.fetch(request);
+    }
+
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       const gate = await this.requireReady();
       if (gate) return gate;

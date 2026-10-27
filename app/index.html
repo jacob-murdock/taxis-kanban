@@ -11,15 +11,16 @@
   <header class="site-header">
     <h1>Taxis Kanban</h1>
     <p class="tagline">Boards</p>
+    <div id="auth-panel" class="auth-panel" aria-live="polite"></div>
     <p id="page-error" class="page-error" role="alert"></p>
   </header>
 
   <main class="stack">
-    <form id="create-board-form" class="create-board">
+    <form id="create-board-form" class="create-board" hidden>
       <input id="new-board-name" type="text" name="name" maxlength="80" required placeholder="Board name" aria-label="Board name" autocomplete="off">
       <button type="submit" class="btn-primary">Create</button>
     </form>
-    <label class="show-archived">
+    <label class="show-archived" hidden>
       <input id="show-archived" type="checkbox">
       Show archived
     </label>
@@ -32,6 +33,7 @@
     <p id="connection-status" class="connection-status" data-state="connecting">Connecting…</p>
   </footer>
 
+  <script type="module" src="/js/auth.js"></script>
   <script type="module" src="/js/boards.js"></script>
 </body>
 </html>
