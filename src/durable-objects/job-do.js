@@ -1,8 +1,12 @@
 import * as Y from "yjs";
-import { YjsRoom } from "./yjs-room.js";
+import { ALARM_CHANGELOG, YjsRoom, mergeIntegratedUpdates } from "./yjs-room.js";
 import { createEmptyCardDoc, materializeCard } from "../lib/materialize.js";
 import { diffCardSnapshots } from "../lib/changelog.js";
-import { CHANGELOG_MAX_ENTRIES, ROLE_RANK } from "../lib/constants.js";
+import {
+  CHANGELOG_DEBOUNCE_MS,
+  CHANGELOG_MAX_ENTRIES,
+  ROLE_RANK,
+} from "../lib/constants.js";
 import { readJson } from "../lib/json.js";
 import {
   clampLabels,
@@ -12,8 +16,16 @@ import {
   clampStoredTitle,
   sameLabels,
 } from "../lib/fields.js";
+import {
+  SYNC_STEP1,
+  SYNC_STEP2,
+  SYNC_UPDATE,
+  captureRemoteUpdates,
+  decodeRoomMessage,
+  encodeSyncUpdate,
+} from "../lib/ws-sync.js";
 
-const CHANGELOG_DEBOUNCE_MS = 400;
+const STORAGE_KEY_CHANGELOG_ACTOR = "changelog:actor";
 
 // Board-card summary fields; columnId and rank are owned by BoardDO placement.
 const SUMMARY_FIELDS = new Set(["title", "due", "assignee", "labels", "archived"]);
@@ -25,7 +37,6 @@ export class JobDO extends YjsRoom {
     });
     this.changelogReady = false;
     this.lastSnapshot = null;
-    this.changelogTimer = null;
     /** In-flight flushChangelog promise, so export can wait for its rows. */
     this.changelogFlight = null;
     this.suspendChangelog = false;
@@ -82,29 +93,62 @@ export class JobDO extends YjsRoom {
     doc.getText("body").observe(onChange);
   }
 
+  hasChangelogAlarm() {
+    this.ensureSchema();
+    return (
+      this.ctx.storage.sql
+        .exec("SELECT 1 AS ok FROM room_alarms WHERE kind = ? LIMIT 1", ALARM_CHANGELOG)
+        .toArray()[0] != null
+    );
+  }
+
   /**
-   * Debounce changelog writes for one actor. Callers flush a different actor
-   * before applying that person's edit. The timer closes over `nextActor` so a
-   * later request cannot relabel this batch.
+   * Debounce changelog writes for one actor via the shared DO alarm clock.
+   * Survives hibernation (unlike setTimeout). Callers flush a different actor
+   * before applying that person's edit.
    */
   scheduleChangelog(actor) {
     const nextActor = actor || this.pendingActor || "system";
     this.pendingActor = nextActor;
-    if (this.changelogTimer) clearTimeout(this.changelogTimer);
-    this.changelogTimer = setTimeout(() => {
-      this.changelogTimer = null;
-      void this.flushChangelog(nextActor).catch((err) => {
-        console.error("Changelog flush failed", err);
-      });
-    }, CHANGELOG_DEBOUNCE_MS);
+    this.ctx.waitUntil(this.armChangelogAlarm(nextActor));
+  }
+
+  /**
+   * Trailing debounce for one actor. The alarm row is written before the first
+   * await: a second editor who arrives during `storage.put` must already see
+   * it and flush this batch as `actor`. The actor is stored after that, and
+   * only while this call is still the pending one (a later editor won the race).
+   */
+  async armChangelogAlarm(actor) {
+    if (this.tombstoned) return;
+    this.clearRoomAlarm(ALARM_CHANGELOG);
+    await this.scheduleRoomAlarm(ALARM_CHANGELOG, Date.now() + CHANGELOG_DEBOUNCE_MS);
+    if (this.tombstoned || this.pendingActor !== actor) return;
+    await this.ctx.storage.put(STORAGE_KEY_CHANGELOG_ACTOR, actor);
+  }
+
+  async clearChangelogAlarm() {
+    this.clearRoomAlarm(ALARM_CHANGELOG);
+    try {
+      await this.ctx.storage.delete(STORAGE_KEY_CHANGELOG_ACTOR);
+    } catch {
+      /* storage may already be cleared on tombstone */
+    }
+    await this.syncAlarmClock();
+  }
+
+  async readChangelogActor() {
+    if (this.pendingActor) return this.pendingActor;
+    const stored = await this.ctx.storage.get(STORAGE_KEY_CHANGELOG_ACTOR);
+    return typeof stored === "string" && stored ? stored : "system";
   }
 
   /** Flush a debounced batch when `nextActor` is about to write as someone else. */
   async flushPendingActor(nextActor) {
-    if (!this.changelogTimer || !this.pendingActor || this.pendingActor === nextActor) return;
+    if (!this.pendingActor || this.pendingActor === nextActor) return;
+    if (!this.hasChangelogAlarm() && !this.changelogFlight) return;
     const previous = this.pendingActor;
-    clearTimeout(this.changelogTimer);
-    this.changelogTimer = null;
+    await this.clearChangelogAlarm();
     await this.flushChangelog(previous);
   }
 
@@ -124,12 +168,40 @@ export class JobDO extends YjsRoom {
         await this.changelogFlight;
         continue;
       }
-      if (!this.changelogTimer) return;
-      const author = this.pendingActor || "system";
-      clearTimeout(this.changelogTimer);
-      this.changelogTimer = null;
+      if (!this.hasChangelogAlarm()) return;
+      const author = await this.readChangelogActor();
+      await this.clearChangelogAlarm();
       await this.flushChangelog(author);
     }
+  }
+
+  async alarm() {
+    // Clear and flush before super.alarm() so a past changelog row cannot
+    // become the soonest deadline again and spin the DO alarm.
+    this.ensureSchema();
+    const now = Date.now();
+    const changelogDue =
+      this.ctx.storage.sql
+        .exec(
+          "SELECT 1 AS ok FROM room_alarms WHERE kind = ? AND at <= ? LIMIT 1",
+          ALARM_CHANGELOG,
+          now,
+        )
+        .toArray()[0] != null;
+    if (changelogDue) {
+      const author = await this.readChangelogActor();
+      // The row goes before the flush. The edit is already in the Yjs log, so
+      // a crash here, or a flush that throws, skips this changelog batch
+      // instead of leaving a due row that would fire again immediately.
+      await this.clearChangelogAlarm();
+      try {
+        await this.ensureDoc();
+        await this.flushChangelog(author);
+      } catch (err) {
+        console.error("Changelog flush failed", err);
+      }
+    }
+    return super.alarm();
   }
 
   async applyChangelog(author) {
@@ -251,49 +323,97 @@ export class JobDO extends YjsRoom {
     return super.fetch(request);
   }
 
+  /** Viewers publish presence too; a deleted card does not. */
+  async awarenessPermitted() {
+    if (await this.isTombstoned()) return false;
+    return this.isReady();
+  }
+
   async webSocketMessage(ws, message) {
     if (typeof message === "string") return;
-    const attachment = ws.deserializeAttachment() || {};
-    // Viewers may subscribe but inbound updates are dropped.
-    if ((ROLE_RANK[attachment.role] ?? 0) < ROLE_RANK.editor) return;
+    if (await this.relayAwareness(ws, message)) return;
     if (await this.isTombstoned()) return;
     if (!(await this.isReady())) return;
 
+    const parsed = decodeRoomMessage(message);
+    if (!parsed) return;
+
+    await this.ensureDoc();
+
+    // Viewers (and everyone) may run the state-vector handshake.
+    if (parsed.syncType === SYNC_STEP1) {
+      this.replySyncStep1(ws, parsed.payload);
+      return;
+    }
+
+    if (parsed.syncType !== SYNC_STEP2 && parsed.syncType !== SYNC_UPDATE) return;
+
+    const attachment = ws.deserializeAttachment() || {};
+    // Viewers may subscribe but inbound document updates are dropped.
+    if ((ROLE_RANK[attachment.role] ?? 0) < ROLE_RANK.editor) return;
+
     const actor = attachment.email || "system";
     await this.flushPendingActor(actor);
-    await this.ensureDoc();
     this.pendingActor = actor;
 
     const before = this.captureProtected();
-    const update = new Uint8Array(message);
+    const update = parsed.payload;
+    const doc = this.doc;
     this.suspendChangelog = true;
+    let outbound = null;
+    let correction = null;
     try {
       // Inlined from YjsRoom so the changelog diff is taken before the next
       // await. super.webSocketMessage persists first, and another editor can
       // land inside that gap.
-      try {
-        Y.applyUpdate(this.doc, update, "remote");
-      } catch (err) {
-        console.error("Invalid Yjs update", err);
-        this.resetInMemoryDoc();
+      //
+      // Apply, then reconcile, then forward one net update. Relaying the raw
+      // client bytes first lets peers flash forged id/boardId/columnId (or
+      // unclamped fields) until a second correction frame arrives.
+      // The bytes are whatever `"update"` emitted. Re-encoding from the state
+      // vector before apply would include the whole delete set and look like a
+      // change after any deletion, including on a no-op step-2 reply.
+      let invalid = false;
+      const appliedParts = captureRemoteUpdates(doc, () => {
         try {
-          ws.close(1003, "invalid update");
+          Y.applyUpdate(doc, update, "remote");
+        } catch (err) {
+          console.error("Invalid Yjs update", err);
+          invalid = true;
+          this.resetInMemoryDoc();
+          try {
+            ws.close(1003, "invalid update");
+          } catch {
+            /* already closing */
+          }
+        }
+      });
+      if (invalid) return;
+
+      const correctionParts = captureRemoteUpdates(doc, () => {
+        this.reconcileRemote(before);
+      });
+      correction = mergeIntegratedUpdates(correctionParts);
+      outbound = mergeIntegratedUpdates(appliedParts.concat(correctionParts));
+      if (outbound) {
+        const frame = encodeSyncUpdate(outbound);
+        for (const peer of this.ctx.getWebSockets()) {
+          if (peer !== ws) peer.send(frame);
+        }
+      }
+      if (correction) {
+        try {
+          ws.send(encodeSyncUpdate(correction));
         } catch {
           /* already closing */
         }
-        return;
       }
-      for (const peer of this.ctx.getWebSockets()) {
-        if (peer !== ws) peer.send(update);
-      }
-      this.reconcileRemote(before);
     } finally {
       this.suspendChangelog = false;
     }
 
-    const persisted = this.appendUpdate(update);
-    const logged = this.flushChangelog(actor);
-    await logged;
+    const persisted = outbound ? this.appendUpdate(outbound) : Promise.resolve();
+    if (outbound) this.scheduleChangelog(actor);
     await persisted;
   }
 
@@ -310,7 +430,11 @@ export class JobDO extends YjsRoom {
     };
   }
 
-  /** Put protected keys back and clamp title, assignee, due, and labels. */
+  /**
+   * Put protected keys back and clamp title, assignee, due, and labels.
+   * Returns true when the doc changed. Uses origin "remote" so the room
+   * listener does not persist or broadcast this fix-up on its own.
+   */
   reconcileRemote(before) {
     const fields = this.doc.getMap("fields");
     const labels = this.doc.getArray("labels");
@@ -340,7 +464,7 @@ export class JobDO extends YjsRoom {
       !archivedDrift &&
       !labelsDrift
     ) {
-      return;
+      return false;
     }
 
     this.doc.transact(() => {
@@ -355,7 +479,8 @@ export class JobDO extends YjsRoom {
         if (labels.length) labels.delete(0, labels.length);
         if (nextLabels.length) labels.push(nextLabels);
       }
-    });
+    }, "remote");
+    return true;
   }
 
   /**
@@ -417,7 +542,7 @@ export class JobDO extends YjsRoom {
     this.doc.transact(() => {
       this.doc.getMap("fields").set("columnId", body.columnId);
     });
-    await this.flushChangelog(actor);
+    // wireChangelog arms the shared changelog alarm (trailing debounce).
     // BoardDO drops the retry row on 200. The column has to be durable first.
     if (!(await this.awaitPersisted())) {
       return Response.json({ error: "Failed to persist" }, { status: 500 });

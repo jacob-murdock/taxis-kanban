@@ -14,6 +14,9 @@ export const DOC_SCHEMA_VERSION = 1;
 /** Keep this many newest changelog rows per card. */
 export const CHANGELOG_MAX_ENTRIES = 500;
 
+/** Debounce changelog SQL writes / board summary sync after edits. */
+export const CHANGELOG_DEBOUNCE_MS = 400;
+
 /** First retry delay for a failed cross-DO replica write; doubles each attempt. */
 export const OUTBOUND_BACKOFF_MS = 5_000;
 export const OUTBOUND_BACKOFF_MAX_MS = 300_000;
@@ -53,3 +56,20 @@ export const BOARD_ROLES = Object.keys(ROLE_RANK);
 /** Roles that can be granted via invite link (owners are created or promoted separately). */
 export const INVITE_ROLES = ["editor", "viewer"];
 export const WS_CLOSE_REVOKED = 4403;
+
+/**
+ * Awareness frames are tiny (one client, an email, an optional field name).
+ * Anything larger is dropped before it is decoded or relayed.
+ */
+export const AWARENESS_UPDATE_MAX_BYTES = 1024;
+export const AWARENESS_FRAME_MAX_BYTES = 1200;
+/** A live client increments this about once per edit or 15s heartbeat. */
+export const AWARENESS_CLOCK_MAX = 1_000_000;
+/** Per-socket publish budget. Heartbeats are ~1/15s; this absorbs a join burst. */
+export const AWARENESS_SOCKET_LIMIT = 30;
+export const AWARENESS_SOCKET_WINDOW_MS = 10_000;
+/** Room-wide relay budget so many sockets cannot fan out together. */
+export const AWARENESS_ROOM_LIMIT = 400;
+export const AWARENESS_ROOM_WINDOW_MS = 10_000;
+/** Extra tabs still sync the document; only this many may publish presence. */
+export const AWARENESS_SOCKETS_PER_EMAIL = 4;

@@ -3,6 +3,7 @@
  */
 
 import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
+import { bindPresence } from "./presence.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
 
 const NAME_MAX = 80;
@@ -11,6 +12,7 @@ const TITLE_MAX = 200;
 const { boardId } = readRouteIds();
 
 const statusEl = document.getElementById("connection-status");
+const presenceEl = document.getElementById("presence");
 const boardEl = document.getElementById("board");
 const boardNameEl = document.getElementById("board-name");
 const archivedBanner = document.getElementById("archived-banner");
@@ -40,6 +42,8 @@ let dragCardId = null;
 let suppressClick = false;
 let myRole = null;
 let myEmail = null;
+let room = null;
+let presence = null;
 const adding = new Set();
 
 function canEditBoard() {
@@ -448,9 +452,23 @@ async function addCard(columnId, input) {
   }
 }
 
+function releaseLive() {
+  presence?.destroy();
+  presence = null;
+  const current = room;
+  room = null;
+  current?.disconnect();
+}
+
+window.addEventListener("pagehide", (event) => {
+  if (event.persisted) return;
+  releaseLive();
+});
+
 function showMissing() {
   missing = true;
   renderPending = false;
+  releaseLive();
   boardNameEl.textContent = "Board not found";
   boardNameEl.removeAttribute("contenteditable");
   addColumnForm.hidden = true;
@@ -876,7 +894,8 @@ async function bootstrap() {
     setError(err.message);
   }
 
-  const room = connectYjsRoom(API.boardWs(boardId), {
+  room = connectYjsRoom(API.boardWs(boardId), {
+    user: myEmail ? { email: myEmail } : null,
     stillThere: () => stillExists(API.boardSnapshot(boardId)),
     onMissing: showMissing,
     onClose(event) {
@@ -891,6 +910,7 @@ async function bootstrap() {
     },
   });
   room.bindStatus(statusEl);
+  presence = bindPresence(presenceEl, room.awareness, { selfEmail: myEmail });
 
   doc = await room.ready;
   if (!doc) return;

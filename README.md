@@ -31,12 +31,12 @@ browser ──cookie + HTTP /api/*──▶ Worker ──▶ AuthDO     (one: li
 
 - **Worker** (`src/index.js`, `src/routes/`) validates sessions and roles, routes `/api/*` and WebSocket upgrades to the right Durable Object, strips client-supplied actor headers and sets trusted identity, and serves `app/` as static assets. Signed-out visitors to a well-formed `/b/…` path are sent to sign in (the same redirect whether or not that board exists). Signed-in non-members get the same `404.html` as a missing board.
 - **AuthDO** is a singleton (`idFromName("auth")`). It stores magic-link hashes, a per-email session generation counter (logout bumps it), memberships, invites, and rate limits. At this scale one AuthDO hit per gated request is fine.
-- **YjsRoom** (`src/durable-objects/yjs-room.js`) is the shared base. It owns one `Y.Doc`, accepts [hibernatable WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), and sends each new client the full state. Each change is appended to a SQLite update log and folded into a snapshot every 50 updates or 30 seconds after the first unfolded one, so a single edit does not rewrite the whole document. The snapshot row stores a schema version; `ensureDoc` runs `migrateDoc` when a room is behind. A Durable Object has one alarm; that clock is the soonest of Yjs compaction and outbound replica retries. Socket attachments carry `{email, role}` for authorship and revoke.
+- **YjsRoom** (`src/durable-objects/yjs-room.js`) is the shared base. It owns one `Y.Doc`, accepts [hibernatable WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), and syncs with [y-protocols](https://github.com/yjs/y-protocols) step 1/2 (state vectors) so connect/reconnect moves a diff rather than a full snapshot. Awareness is not persisted. Before a frame is relayed, the room rewrites it to that socket's session email and a server-assigned client id, and drops frames that name any other client or exceed a small rate limit, so a member cannot impersonate someone, clear another person's presence, or fan a forged flood out to the room. Each change is appended to a SQLite update log and folded into a snapshot every 50 updates or 30 seconds after the first unfolded one, so a single edit does not rewrite the whole document. The snapshot row stores a schema version; `ensureDoc` runs `migrateDoc` when a room is behind. A Durable Object has one alarm; that clock is the soonest of Yjs compaction, outbound replica retries, and (on cards) changelog debounce. Socket attachments carry `{email, role}` for authorship and revoke, plus the presence client id.
 - **CatalogDO** holds the board list (id, name, archived, created time). BoardDO keeps it in sync and retries a failed upsert via the outbound alarm. The Worker filters the catalog snapshot to the caller's memberships.
 - **BoardDO** holds one board: its name, an ordered array of columns, and a map of card summaries (title, column, rank, assignee, due, labels, archived). Placement (column and rank) lives here; a move also copies `columnId` onto the card and retries if that write fails.
-- **JobDO** holds one card document: a map of fields plus a `Y.Text` body and a labels array. A debounced observer diffs each change against the last snapshot, writes it to a `changelog` table (with the actor's email, capped at 500 rows), and pushes summary fields to BoardDO with the same retry. Viewer sockets are read-only: inbound updates are dropped.
+- **JobDO** holds one card document: a map of fields plus a `Y.Text` body and a labels array. An alarm-backed debounce diffs each change against the last snapshot, writes it to a `changelog` table (with the actor's email, capped at 500 rows), and pushes summary fields to BoardDO with the same retry — the deadline lives in `room_alarms` so hibernation cannot drop it. Viewer sockets are read-only: inbound document updates are dropped.
 
-**Who writes what.** The board socket is read-only. Board and column changes, card creation, moves, archive and delete all go over HTTP and require editor (or owner where noted). The card socket is writable for editors and owners; viewers subscribe only. The server reverts protected keys (`id`, `boardId`, `columnId`) and clamps field lengths.
+**Who writes what.** The board socket is read-only. Board and column changes, card creation, moves, archive and delete all go over HTTP and require editor (or owner where noted). The card socket is writable for editors and owners; viewers subscribe only. The server reverts protected keys (`id`, `boardId`, `columnId`) and clamps field lengths. Presence is not a document write: every connected member, viewers included, may publish it, but only as themselves.
 
 **Ordering.** Cards carry integer ranks spaced 1024 apart. A move takes the midpoint of its neighbours and renumbers the column when the gap runs out.
 
@@ -150,9 +150,10 @@ src/
 app/
   index.html  board.html  card.html  invite.html  404.html  css/app.css
   js/
-    yjs-sync.js             client room connection
+    yjs-sync.js             client room connection + awareness
+    presence.js             presence list UI
     auth.js  invite.js  boards.js  board.js  card.js  card-model.js  config.js
-    vendor/                 bundled Yjs (generated)
+    vendor/                 bundled Yjs + ws-sync (generated)
 ```
 
 ## License

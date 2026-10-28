@@ -1,6 +1,11 @@
 import * as Y from "yjs";
 import { DurableObject } from "cloudflare:workers";
 import {
+  AWARENESS_ROOM_LIMIT,
+  AWARENESS_ROOM_WINDOW_MS,
+  AWARENESS_SOCKET_LIMIT,
+  AWARENESS_SOCKET_WINDOW_MS,
+  AWARENESS_SOCKETS_PER_EMAIL,
   DOC_SCHEMA_VERSION,
   OUTBOUND_BACKOFF_MAX_MS,
   OUTBOUND_BACKOFF_MS,
@@ -8,14 +13,34 @@ import {
   YJS_COMPACT_ALARM_MS,
   YJS_COMPACT_EVERY,
 } from "../lib/constants.js";
+import {
+  SYNC_STEP1,
+  SYNC_STEP2,
+  SYNC_UPDATE,
+  allocateAwarenessClientId,
+  bumpRateWindow,
+  captureRemoteUpdates,
+  classifyAwarenessFrame,
+  decodeRoomMessage,
+  encodeAwarenessFrame,
+  encodeAwarenessLeave,
+  encodeSyncStep1,
+  encodeSyncStep2,
+  encodeSyncUpdate,
+  presencePublishAllowed,
+  sanitizeAwarenessUpdate,
+} from "../lib/ws-sync.js";
 
 const STORAGE_KEY_STATE = "ydoc:state";
 const STORAGE_KEY_READY = "ready";
 export const STORAGE_KEY_TOMBSTONE = "tombstone";
 
-/** Alarm kind: fold the update log. Other kinds (outbound replicas) share this clock. */
+/** Alarm kinds that share the Durable Object alarm clock via `room_alarms`. */
 const ALARM_COMPACT = "yjs-compact";
 const ALARM_OUTBOUND = "outbound-sync";
+/** JobDO: debounced changelog flush (survives hibernation). */
+export const ALARM_CHANGELOG = "changelog";
+const KNOWN_ROOM_ALARMS = [ALARM_COMPACT, ALARM_OUTBOUND, ALARM_CHANGELOG];
 
 /**
  * Shared Yjs-over-WebSocket room logic for hibernatable Durable Objects.
@@ -34,6 +59,9 @@ export class YjsRoom extends DurableObject {
     this.persistTail = Promise.resolve();
     /** Serializes replica sends so an older in-flight write cannot clobber a newer one. */
     this.outboundTail = Promise.resolve();
+    /** In-memory room-wide awareness budget. A flood keeps the object awake, so this holds. */
+    this.awRoomWindow = 0;
+    this.awRoomCount = 0;
   }
 
   /** Load the doc once; concurrent callers share the same promise. */
@@ -107,12 +135,10 @@ export class YjsRoom extends DurableObject {
     this.doc.on("update", (update, origin) => {
       if (origin === "remote") return;
       this.ctx.waitUntil(this.appendUpdate(update));
-      for (const peer of this.ctx.getWebSockets()) {
-        peer.send(update);
-      }
+      sendToPeers(this.ctx, encodeSyncUpdate(update));
     });
 
-    if (migrationUpdate) sendToPeers(this.ctx, migrationUpdate);
+    if (migrationUpdate) sendToPeers(this.ctx, encodeSyncUpdate(migrationUpdate));
 
     if (this.pendingUpdateCount() > 0) {
       await this.scheduleRoomAlarm(ALARM_COMPACT, Date.now() + YJS_COMPACT_ALARM_MS);
@@ -160,9 +186,8 @@ export class YjsRoom extends DurableObject {
     // Drop alarms this process no longer handles (the old card snapshot clock).
     // A past row left behind is the soonest deadline and the DO alarm spins.
     this.ctx.storage.sql.exec(
-      "DELETE FROM room_alarms WHERE kind NOT IN (?, ?)",
-      ALARM_COMPACT,
-      ALARM_OUTBOUND,
+      `DELETE FROM room_alarms WHERE kind NOT IN (${KNOWN_ROOM_ALARMS.map(() => "?").join(", ")})`,
+      ...KNOWN_ROOM_ALARMS,
     );
     this.schemaReady = true;
   }
@@ -630,10 +655,11 @@ export class YjsRoom extends DurableObject {
 
     await this.ensureDoc();
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ email, role });
+    const awarenessClientId = allocateAwarenessClientId(this.awarenessClientIds());
+    server.serializeAttachment({ email, role, awarenessClientId });
 
-    const snapshot = Y.encodeStateAsUpdate(this.doc);
-    server.send(snapshot);
+    // Client initiates with SyncStep1; we reply with the missing diff (step 2)
+    // plus our own step 1. Do not push a full snapshot here.
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -660,18 +686,149 @@ export class YjsRoom extends DurableObject {
     return Response.json({ ok: true, closed });
   }
 
-  async webSocketMessage(ws, message) {
-    // Board/catalog rooms are read-only over the socket; mutations go through HTTP.
-    if (this.options.clientUpdates === false) return;
+  /**
+   * Boards and the catalog have no extra presence gate. JobDO overrides this
+   * so a tombstoned card does not keep relaying.
+   */
+  async awarenessPermitted() {
+    return true;
+  }
 
-    // Yjs updates are binary; a text frame is never a valid update.
+  /** Client ids already bound to open sockets. */
+  awarenessClientIds() {
+    const used = new Set();
+    for (const peer of this.ctx.getWebSockets()) {
+      const id = peer.deserializeAttachment()?.awarenessClientId;
+      if (Number.isInteger(id)) used.add(id);
+    }
+    return used;
+  }
+
+  /**
+   * Handle a presence frame. Returns true when `message` is awareness (relayed
+   * or dropped). The sender's client id and email are replaced with the values
+   * stored on the socket at upgrade — the session email, and an id this socket
+   * alone holds — so a member cannot impersonate, clear, or multiply peers.
+   */
+  async relayAwareness(ws, message) {
+    const kind = classifyAwarenessFrame(message);
+    if (kind == null) return false;
+    // Huge frames are dropped before decode. Over-budget sockets are dropped
+    // before the storage read in awarenessPermitted.
+    if (kind === "oversize" || !this.allowSocketAwareness(ws)) return true;
+    if (!(await this.awarenessPermitted())) return true;
+    if (!this.publishesPresence(ws)) return true;
+
+    const parsed = decodeRoomMessage(message);
+    const attachment = ws.deserializeAttachment() || {};
+    const update =
+      parsed?.type === "awareness"
+        ? sanitizeAwarenessUpdate(parsed.payload, {
+            clientId: attachment.awarenessClientId,
+            email: attachment.email,
+          })
+        : null;
+    if (!update || !this.allowRoomAwareness()) return true;
+
+    const frame = encodeAwarenessFrame(update);
+    for (const peer of this.ctx.getWebSockets()) {
+      if (peer === ws) continue;
+      try {
+        peer.send(frame);
+      } catch {
+        /* already closing */
+      }
+    }
+    return true;
+  }
+
+  /** Per-socket budget, persisted on the attachment so hibernation does not reset it. */
+  allowSocketAwareness(ws) {
+    const attachment = ws.deserializeAttachment() || {};
+    const next = bumpRateWindow(
+      Date.now(),
+      attachment.awWindow,
+      attachment.awCount,
+      AWARENESS_SOCKET_LIMIT,
+      AWARENESS_SOCKET_WINDOW_MS,
+    );
+    if (!next.allowed) return false;
+    ws.serializeAttachment({
+      ...attachment,
+      awWindow: next.windowStart,
+      awCount: next.count,
+    });
+    return true;
+  }
+
+  allowRoomAwareness() {
+    const next = bumpRateWindow(
+      Date.now(),
+      this.awRoomWindow,
+      this.awRoomCount,
+      AWARENESS_ROOM_LIMIT,
+      AWARENESS_ROOM_WINDOW_MS,
+    );
+    if (!next.allowed) return false;
+    this.awRoomWindow = next.windowStart;
+    this.awRoomCount = next.count;
+    return true;
+  }
+
+  publishesPresence(ws) {
+    const self = ws.deserializeAttachment() || {};
+    const entries = [];
+    for (const peer of this.ctx.getWebSockets()) {
+      const att = peer.deserializeAttachment() || {};
+      entries.push({ email: att.email, clientId: att.awarenessClientId });
+    }
+    return presencePublishAllowed(
+      entries,
+      self.email,
+      self.awarenessClientId,
+      AWARENESS_SOCKETS_PER_EMAIL,
+    );
+  }
+
+  /** Answer SyncStep1: the bytes this client is missing, then our state vector. */
+  replySyncStep1(ws, stateVector) {
+    try {
+      ws.send(encodeSyncStep2(this.doc, stateVector));
+      ws.send(encodeSyncStep1(this.doc));
+    } catch {
+      /* already closing */
+    }
+  }
+
+  async webSocketMessage(ws, message) {
+    // Yjs sync/awareness frames are binary; a text frame is never valid.
     if (typeof message === "string") return;
+    if (await this.relayAwareness(ws, message)) return;
+
+    const parsed = decodeRoomMessage(message);
+    if (!parsed) return;
 
     await this.ensureDoc();
-    const update = new Uint8Array(message);
 
+    if (parsed.syncType === SYNC_STEP1) {
+      this.replySyncStep1(ws, parsed.payload);
+      return;
+    }
+
+    // Board/catalog rooms are read-only over the socket; mutations go through HTTP.
+    // Drop SyncStep2 (handshake reply) and Update — clients initiate sync, and an
+    // empty step-2 reply is normal; forged step-2 must not mutate the doc.
+    if (this.options.clientUpdates === false) return;
+    if (parsed.syncType !== SYNC_STEP2 && parsed.syncType !== SYNC_UPDATE) return;
+
+    const update = parsed.payload;
+    const doc = this.doc;
+    let integrated = null;
     try {
-      Y.applyUpdate(this.doc, update, "remote");
+      const parts = captureRemoteUpdates(doc, () => {
+        Y.applyUpdate(doc, update, "remote");
+      });
+      integrated = mergeIntegratedUpdates(parts);
     } catch (err) {
       console.error("Invalid Yjs update", err);
       this.resetInMemoryDoc();
@@ -684,18 +841,52 @@ export class YjsRoom extends DurableObject {
     }
     this.options.onUpdateApplied?.(update);
 
+    // Nothing integrated (a step-2 reply the doc already has, including one
+    // that is only the historical delete set) is not relayed or logged.
+    if (!integrated) return;
+    const frame = encodeSyncUpdate(integrated);
     for (const peer of this.ctx.getWebSockets()) {
-      if (peer !== ws) {
-        peer.send(update);
+      if (peer !== ws) peer.send(frame);
+    }
+    await this.appendUpdate(integrated);
+  }
+
+  async webSocketClose(ws) {
+    // A quiet awareness client otherwise lingers about 30 seconds. Tell peers
+    // this socket left so its presence drops with the connection.
+    this.broadcastAwarenessLeave(ws);
+  }
+
+  broadcastAwarenessLeave(ws) {
+    let clientId;
+    try {
+      clientId = ws.deserializeAttachment()?.awarenessClientId;
+    } catch {
+      return;
+    }
+    if (!Number.isInteger(clientId)) return;
+    let frame;
+    try {
+      frame = encodeAwarenessLeave(clientId);
+    } catch {
+      return;
+    }
+    for (const peer of this.ctx.getWebSockets()) {
+      if (peer === ws) continue;
+      try {
+        peer.send(frame);
+      } catch {
+        /* already closing */
       }
     }
-
-    await this.appendUpdate(update);
   }
+}
 
-  async webSocketClose(_ws, _code, _reason, _wasClean) {
-    // Hibernatable — no cleanup needed for stateless relay.
-  }
+/** One update for peers. Empty when the doc integrated nothing. */
+export function mergeIntegratedUpdates(parts) {
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
+  return Y.mergeUpdates(parts);
 }
 
 function sendToPeers(ctx, update) {

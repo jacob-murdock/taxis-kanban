@@ -4,11 +4,13 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "build:client": "esbuild yjs --bundle --format=esm --minify --outfile=app/js/vendor/yjs.js",
+    "build:client": "esbuild yjs --bundle --format=esm --minify --outfile=app/js/vendor/yjs.js && esbuild src/lib/ws-sync.js --bundle --format=esm --minify --alias:yjs=./yjs.js --external:./yjs.js --outfile=app/js/vendor/ws-sync.js",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
+    "lib0": "0.2.117",
+    "y-protocols": "1.0.6",
     "yjs": "13.6.31"
   },
   "devDependencies": {

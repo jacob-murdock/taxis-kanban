@@ -2,6 +2,7 @@
 
 import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
 import { readCard } from "./card-model.js";
+import { bindPresence } from "./presence.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
 
 const TITLE_MAX = 200;
@@ -12,6 +13,7 @@ const LABEL_MAX_COUNT = 20;
 const { boardId, cardId } = readRouteIds();
 
 const statusEl = document.getElementById("connection-status");
+const presenceEl = document.getElementById("presence");
 const backLink = document.getElementById("back-link");
 const titleEl = document.getElementById("card-title");
 const metaEl = document.getElementById("card-meta");
@@ -36,6 +38,9 @@ let columns = [];
 let columnSignature = "";
 let fillingColumn = false;
 let myRole = null;
+let myEmail = null;
+let presence = null;
+let room = null;
 const focused = new Set();
 
 function canEditCard() {
@@ -50,11 +55,25 @@ function setError(message) {
   errorEl.textContent = message || "";
 }
 
+function releaseLive() {
+  presence?.destroy();
+  presence = null;
+  const current = room;
+  room = null;
+  current?.disconnect();
+}
+
 function showDeleted() {
   gone = true;
+  releaseLive();
   titleEl.textContent = "Card deleted";
   setStatus(statusEl, "error", "This card was deleted");
 }
+
+window.addEventListener("pagehide", (event) => {
+  if (event.persisted) return;
+  releaseLive();
+});
 
 function setField(key, value) {
   if (!canEditCard()) return;
@@ -81,7 +100,8 @@ async function bootstrap() {
   applyViewOnly();
   if (boardId) backLink.href = `/b/${encodeURIComponent(boardId)}`;
   try {
-    await requestJson(API.me);
+    const me = await requestJson(API.me);
+    myEmail = me.email || null;
   } catch (err) {
     if (err.status === 401) return;
   }
@@ -108,8 +128,9 @@ async function bootstrap() {
   void loadHistory();
   void loadColumns();
 
-  const room = connectYjsRoom(API.cardWs(boardId, cardId), {
+  room = connectYjsRoom(API.cardWs(boardId, cardId), {
     writable: canEditCard(),
+    user: myEmail ? { email: myEmail } : null,
     stillThere: () => stillExists(API.cardSnapshot(boardId, cardId)),
     onMissing: showDeleted,
     onClose(event) {
@@ -126,6 +147,7 @@ async function bootstrap() {
     },
   });
   room.bindStatus(statusEl);
+  presence = bindPresence(presenceEl, room.awareness, { selfEmail: myEmail });
 
   doc = await room.ready;
   if (!doc) return;
@@ -364,8 +386,16 @@ function wireEditors() {
 }
 
 function trackFocus(el, key) {
-  el.addEventListener("focus", () => focused.add(key));
-  el.addEventListener("blur", () => focused.delete(key));
+  el.addEventListener("focus", () => {
+    focused.add(key);
+    presence?.setEditing(key);
+  });
+  el.addEventListener("blur", () => {
+    focused.delete(key);
+    // Prefer another still-focused field if focus moved within the card.
+    const next = focused.values().next().value || null;
+    presence?.setEditing(next);
+  });
 }
 
 /**

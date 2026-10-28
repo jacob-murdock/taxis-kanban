@@ -34,6 +34,13 @@ body {
   padding: 1rem 1.5rem;
 }
 
+.site-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem 1.25rem;
+}
+
 .site-header h1 {
   margin: 0;
   font-size: 1.5rem;
@@ -585,6 +592,29 @@ body.view-only #board-name {
 
 .connection-status[data-state="error"] {
   color: #8b0000;
+}
+
+.presence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.presence-label {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.presence-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 
 @media (max-width: 900px) {
