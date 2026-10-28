@@ -1,6 +1,7 @@
 /** Sign-in panel for the board list. */
 
 import { API, requestJson, safeNextPath } from "./config.js";
+import { bumpSessionGen, forgetSession, rememberSession } from "./local-session.js";
 
 const panel = document.getElementById("auth-panel");
 const errorEl = document.getElementById("page-error");
@@ -29,6 +30,7 @@ async function initAuthPanel(root) {
 
   root.replaceChildren();
   if (me?.email) {
+    rememberSession({ email: me.email });
     root.append(buildSignedIn(me.email));
     return;
   }
@@ -52,6 +54,15 @@ function buildSignedIn(email) {
     setError("");
     try {
       await requestJson(API.authLogout, { method: "POST", body: {} });
+      // Bump before the IndexedDB import so another tab stops writing immediately.
+      bumpSessionGen();
+      forgetSession();
+      try {
+        const { clearUser } = await import("./doc-store.js");
+        await clearUser(email);
+      } catch {
+        /* The cookie is already gone if the log cannot be cleared. */
+      }
       location.assign("/");
     } catch (err) {
       setError(err.message || "Sign out failed");

@@ -17,6 +17,7 @@ Make as many boards as you like, each with its own columns. Everyone on a board 
 - **Board export.** Download one JSON dump of the board, its materialized cards, and each card's changelog. A large board is read a page of cards at a time.
 - **Archive and delete.** Archived cards leave their column and can be restored. Deleted cards are tombstoned, so a stale client can't bring them back.
 - **Reconnects on its own.** Clients reconnect with backoff and resync on arrival. Logout, a removed membership, or a role change closes that person's live sockets. A role change reloads the page if you still belong.
+- **Card edits survive a reload.** An editor's card document is mirrored in IndexedDB and joined on the next sync, so a reload does not drop edits made while the socket was down. If the account or card snapshot can't be reached, the page still opens that copy for the last known editor. Column moves and other HTTP writes still need the network.
 - **No build framework.** The client is plain HTML, CSS and ES modules. Yjs is bundled locally by esbuild, so nothing loads from a CDN.
 
 ## Architecture

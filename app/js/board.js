@@ -3,6 +3,7 @@
  */
 
 import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
+import { rememberSession } from "./local-session.js";
 import { bindPresence } from "./presence.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
 
@@ -876,6 +877,7 @@ async function bootstrap() {
   try {
     const me = await requestJson(API.me);
     myEmail = me.email;
+    if (myEmail) rememberSession({ email: myEmail });
   } catch (err) {
     if (err.status === 401) return;
     setError(err.message);
@@ -884,6 +886,7 @@ async function bootstrap() {
   try {
     const snapshot = await requestJson(API.boardSnapshot(boardId));
     myRole = snapshot.role || null;
+    if (myEmail && myRole) rememberSession({ email: myEmail, boardId, role: myRole });
     showAccessChrome();
     void loadMembersPanel();
   } catch (err) {

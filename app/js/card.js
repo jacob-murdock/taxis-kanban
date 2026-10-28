@@ -2,6 +2,8 @@
 
 import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
 import { readCard } from "./card-model.js";
+import { cardDocKey, clearDoc } from "./doc-store.js";
+import { cachedSession, rememberSession } from "./local-session.js";
 import { bindPresence } from "./presence.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
 
@@ -63,9 +65,17 @@ function releaseLive() {
   current?.disconnect();
 }
 
+function storedDocKey() {
+  if (!myEmail || !boardId || !cardId) return null;
+  return cardDocKey(myEmail, boardId, cardId);
+}
+
 function showDeleted() {
   gone = true;
+  const key = storedDocKey();
+  // Stop the persist listener before deleting, or an in-flight write lands after.
   releaseLive();
+  if (key) void clearDoc(key);
   titleEl.textContent = "Card deleted";
   setStatus(statusEl, "error", "This card was deleted");
 }
@@ -96,12 +106,56 @@ function applyViewOnly() {
   deleteBtn.hidden = !editable;
 }
 
+async function confirmCachedRole() {
+  let email = myEmail;
+  try {
+    const me = await requestJson(API.me);
+    email = me?.email || null;
+  } catch (err) {
+    if (err.status === 401) {
+      releaseLive();
+      location.reload();
+      return;
+    }
+  }
+  if (!email || gone) return;
+  if (email !== myEmail) {
+    rememberSession({ email });
+    releaseLive();
+    location.reload();
+    return;
+  }
+  try {
+    const snapshot = await requestJson(API.cardSnapshot(boardId, cardId));
+    const role = snapshot.role || null;
+    if (!role || gone) return;
+    rememberSession({ email, boardId, role });
+    const wasEditor = canEditCard();
+    myRole = role;
+    if (wasEditor === canEditCard()) {
+      applyViewOnly();
+      return;
+    }
+    // The saved role was wrong. Drop a demoted editor's log so it cannot sync
+    // later, then reload into the role the server just reported.
+    const key = storedDocKey();
+    releaseLive();
+    if (key && !canEditCard()) await clearDoc(key);
+    location.reload();
+  } catch (err) {
+    if (err.status === 404) showDeleted();
+  }
+}
+
 async function bootstrap() {
   applyViewOnly();
   if (boardId) backLink.href = `/b/${encodeURIComponent(boardId)}`;
+  let emailFromNetwork = false;
   try {
     const me = await requestJson(API.me);
     myEmail = me.email || null;
+    emailFromNetwork = Boolean(myEmail);
+    if (myEmail) rememberSession({ email: myEmail });
   } catch (err) {
     if (err.status === 401) return;
   }
@@ -111,25 +165,40 @@ async function bootstrap() {
     return;
   }
 
+  let roleFromCache = false;
   try {
     const snapshot = await requestJson(API.cardSnapshot(boardId, cardId));
     myRole = snapshot.role || null;
+    // Don't stamp a live role onto a cached email from a different account.
+    if (emailFromNetwork && myRole) rememberSession({ email: myEmail, boardId, role: myRole });
     applyViewOnly();
   } catch (err) {
     if (err.status === 404 || err.status === 403) {
+      if (err.status === 404 && emailFromNetwork && myEmail) {
+        void clearDoc(cardDocKey(myEmail, boardId, cardId));
+      }
       titleEl.textContent = "Card not found";
       setStatus(statusEl, "error", err.message);
       return;
     }
-    setError(err.message);
+    if (!emailFromNetwork) myEmail = cachedSession().email;
+    const cachedRole = myEmail ? cachedSession().roles[boardId] : null;
+    if (cachedRole) {
+      myRole = cachedRole;
+      roleFromCache = true;
+      applyViewOnly();
+    } else {
+      setError(err.message);
+    }
   }
 
   wireEditors();
   void loadHistory();
   void loadColumns();
 
-  room = connectYjsRoom(API.cardWs(boardId, cardId), {
+  const liveRoom = connectYjsRoom(API.cardWs(boardId, cardId), {
     writable: canEditCard(),
+    docKey: canEditCard() ? storedDocKey() : null,
     user: myEmail ? { email: myEmail } : null,
     stillThere: () => stillExists(API.cardSnapshot(boardId, cardId)),
     onMissing: showDeleted,
@@ -146,17 +215,33 @@ async function bootstrap() {
       return true;
     },
   });
-  room.bindStatus(statusEl);
-  presence = bindPresence(presenceEl, room.awareness, { selfEmail: myEmail });
+  room = liveRoom;
+  liveRoom.bindStatus(statusEl);
+  presence = bindPresence(presenceEl, liveRoom.awareness, { selfEmail: myEmail });
+  if (roleFromCache) void confirmCachedRole();
 
-  doc = await room.ready;
-  if (!doc) return;
-  renderFromDoc();
-  doc.on("update", (_update, origin) => {
+  let listening = false;
+  function bindDoc(next) {
+    if (!next || gone) return;
+    doc = next;
     renderFromDoc();
-    // Local keystrokes do not echo back; refresh after commits instead.
-    if (origin === "remote") scheduleHistoryRefresh();
+    if (listening) return;
+    listening = true;
+    doc.on("update", (_update, origin) => {
+      renderFromDoc();
+      // Local keystrokes do not echo back; refresh after commits instead.
+      if (origin === "remote") scheduleHistoryRefresh();
+    });
+  }
+
+  void liveRoom.loaded.then(() => {
+    if (gone || room !== liveRoom) return;
+    if (liveRoom.hasLocalData) bindDoc(liveRoom.doc);
   });
+
+  const live = await liveRoom.ready;
+  if (!live || gone || room !== liveRoom) return;
+  bindDoc(live);
 }
 
 async function loadColumns() {
@@ -165,7 +250,8 @@ async function loadColumns() {
     columns = Array.isArray(board.columns) ? board.columns : [];
     if (doc) fillColumnSelect(selectedColumnId());
   } catch (err) {
-    setError(err.message);
+    // A network miss still leaves the saved card editable. A real HTTP error does not.
+    if (err.status) setError(err.message);
   }
 }
 
@@ -377,6 +463,9 @@ function wireEditors() {
     setError("");
     try {
       await requestJson(API.card(boardId, cardId), { method: "DELETE" });
+      const key = storedDocKey();
+      releaseLive();
+      if (key) await clearDoc(key);
       location.assign(`/b/${encodeURIComponent(boardId)}`);
     } catch (err) {
       setError(err.message);

@@ -5,6 +5,7 @@
  * read-only on the socket for document edits.
  */
 
+import { openDocStore } from "./doc-store.js";
 import * as Y from "./vendor/yjs.js";
 import {
   Awareness,
@@ -21,6 +22,8 @@ import {
 } from "./vendor/ws-sync.js";
 
 const MAX_RECONNECT_MS = 15000;
+/** Don't let a stuck IndexedDB open keep the socket from starting. */
+const HYDRATE_WAIT_MS = 1500;
 
 export function setStatus(el, state, label) {
   if (!el) return;
@@ -35,10 +38,13 @@ export function setStatus(el, state, label) {
  * `onMissing` runs once when that check fails. `ready` resolves to null if the
  * room gives up before the first sync.
  * `user` is `{ email }` published into awareness after the first sync.
+ * `docKey` hydrates the doc from IndexedDB before the socket opens so a
+ * reload does not drop unsynced local edits. If that read stalls, the socket
+ * starts anyway and a second step 1 is sent once the saved updates are in.
  */
 export function connectYjsRoom(
   url,
-  { writable = false, user = null, onClose, stillThere, onMissing } = {},
+  { writable = false, user = null, onClose, stillThere, onMissing, docKey } = {},
 ) {
   const doc = new Y.Doc();
   const awareness = new Awareness(doc);
@@ -50,6 +56,10 @@ export function connectYjsRoom(
   let manualClose = false;
   let statusEl = null;
   let reconnectTimer = null;
+  let store = null;
+  let hasLocalData = false;
+  let started = false;
+  let hydrateTimer = null;
   let resolveReady;
   const ready = new Promise((resolve) => {
     resolveReady = resolve;
@@ -57,7 +67,7 @@ export function connectYjsRoom(
 
   if (writable) {
     doc.on("update", (update, origin) => {
-      if (origin === "remote") return;
+      if (origin === "remote" || origin === "idb") return;
       if (ws?.readyState === WebSocket.OPEN) ws.send(encodeSyncUpdate(update));
     });
   }
@@ -169,7 +179,10 @@ export function connectYjsRoom(
   function stop() {
     stopped = true;
     manualClose = true;
+    clearTimeout(hydrateTimer);
     clearTimeout(reconnectTimer);
+    store?.destroy();
+    store = null;
     try {
       removeAwarenessStates(awareness, [awareness.clientID], "local");
     } catch {
@@ -193,7 +206,55 @@ export function connectYjsRoom(
     ws?.close();
   }
 
-  connect();
+  const loaded = (async () => {
+    if (!docKey) return;
+    try {
+      const opened = openDocStore(doc, docKey);
+      store = opened;
+      await opened.whenReady;
+      if (stopped) {
+        opened.destroy();
+        return;
+      }
+      hasLocalData = opened.hasLocalData;
+    } catch {
+      /* IndexedDB failed; live sync still works. */
+    }
+  })();
 
-  return { doc, awareness, ready, bindStatus, disconnect };
+  function begin() {
+    if (stopped || started) return;
+    started = true;
+    connect();
+  }
+
+  // The open handler sends step 1. If that already happened on a partial doc,
+  // ask again so the saved edits are part of the state vector.
+  function resync() {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(encodeSyncStep1(doc));
+  }
+
+  if (docKey) {
+    hydrateTimer = setTimeout(begin, HYDRATE_WAIT_MS);
+    void loaded.then(() => {
+      clearTimeout(hydrateTimer);
+      if (stopped) return;
+      if (started) resync();
+      else begin();
+    });
+  } else {
+    begin();
+  }
+
+  return {
+    doc,
+    awareness,
+    ready,
+    loaded,
+    get hasLocalData() {
+      return hasLocalData;
+    },
+    bindStatus,
+    disconnect,
+  };
 }
