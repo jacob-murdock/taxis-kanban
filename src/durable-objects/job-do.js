@@ -55,6 +55,12 @@ export class JobDO extends YjsRoom {
     return doc;
   }
 
+  resetInMemoryDoc() {
+    super.resetInMemoryDoc();
+    this.changelogReady = false;
+    this.lastSnapshot = null;
+  }
+
   async requireReady() {
     if (await this.isTombstoned()) {
       return Response.json({ error: "Card not found" }, { status: 404 });
@@ -265,7 +271,18 @@ export class JobDO extends YjsRoom {
       // Inlined from YjsRoom so the changelog diff is taken before the next
       // await. super.webSocketMessage persists first, and another editor can
       // land inside that gap.
-      Y.applyUpdate(this.doc, update, "remote");
+      try {
+        Y.applyUpdate(this.doc, update, "remote");
+      } catch (err) {
+        console.error("Invalid Yjs update", err);
+        this.resetInMemoryDoc();
+        try {
+          ws.close(1003, "invalid update");
+        } catch {
+          /* already closing */
+        }
+        return;
+      }
       for (const peer of this.ctx.getWebSockets()) {
         if (peer !== ws) peer.send(update);
       }

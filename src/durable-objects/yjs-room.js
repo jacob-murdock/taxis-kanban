@@ -45,6 +45,12 @@ export class YjsRoom extends DurableObject {
     return this.docReady;
   }
 
+  /** Drop the in-memory doc so the next ensureDoc reloads from SQLite. */
+  resetInMemoryDoc() {
+    this.doc = null;
+    this.docReady = null;
+  }
+
   async loadDoc() {
     this.ensureSchema();
     const legacy = await this.ctx.storage.get(STORAGE_KEY_STATE);
@@ -664,7 +670,18 @@ export class YjsRoom extends DurableObject {
     await this.ensureDoc();
     const update = new Uint8Array(message);
 
-    Y.applyUpdate(this.doc, update, "remote");
+    try {
+      Y.applyUpdate(this.doc, update, "remote");
+    } catch (err) {
+      console.error("Invalid Yjs update", err);
+      this.resetInMemoryDoc();
+      try {
+        ws.close(1003, "invalid update");
+      } catch {
+        /* already closing */
+      }
+      return;
+    }
     this.options.onUpdateApplied?.(update);
 
     for (const peer of this.ctx.getWebSockets()) {
