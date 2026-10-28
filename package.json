@@ -6,7 +6,11 @@
   "scripts": {
     "build:client": "esbuild yjs --bundle --format=esm --minify --outfile=app/js/vendor/yjs.js && esbuild src/lib/ws-sync.js --bundle --format=esm --minify --alias:yjs=./yjs.js --external:./yjs.js --outfile=app/js/vendor/ws-sync.js",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "npm run test:unit && npm run test:workers",
+    "test:unit": "vitest run --config vitest.unit.config.js",
+    "test:workers": "vitest run --config vitest.workers.config.js --maxWorkers=1 --no-isolate",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "lib0": "0.2.117",
@@ -14,7 +18,9 @@
     "yjs": "13.6.31"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.10",
     "esbuild": "0.27.3",
+    "vitest": "4.1.12",
     "wrangler": "4.100.0"
   }
 }

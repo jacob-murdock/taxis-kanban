@@ -122,6 +122,15 @@ npx wrangler secret put SESSION_SECRET   # required; long random string
 npx wrangler secret put RESEND_API_KEY   # optional; real email
 ```
 
+## Tests
+
+```sh
+npm test
+npm run smoke          # optional port: node scripts/smoke.mjs 8799
+```
+
+`npm test` runs the unit tests, then the Workers integration tests: create a board, columns, ranked moves, two card sockets, the read-only board socket, history cursors, and tombstones. `npm run smoke` starts a temporary local server, signs in through the magic link printed in that server's log, and checks the same paths. It does not use `.dev.vars` or `.wrangler/`.
+
 ## Configuration
 
 `wrangler.toml` defines the Worker, `AUTH_DO`, `CATALOG_DO`, `BOARD_DO` and `JOB_DO` bindings (SQLite migrations through `v3`), and the `app/` asset directory. `run_worker_first` lets the Worker check page routes before assets are served. Limits and id formats live in `src/lib/constants.js`.
@@ -153,8 +162,11 @@ app/
   js/
     yjs-sync.js             client room connection + awareness
     presence.js             presence list UI
-    auth.js  invite.js  boards.js  board.js  card.js  card-model.js  config.js
+    auth.js  invite.js  boards.js  board.js  card.js  card-model.js
+    text-diff.js  config.js
     vendor/                 bundled Yjs + ws-sync (generated)
+scripts/smoke.mjs           local smoke against a temporary wrangler dev
+test/                       unit tests and Workers integration tests
 ```
 
 ## License
