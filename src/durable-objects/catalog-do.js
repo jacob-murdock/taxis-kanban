@@ -31,6 +31,10 @@ export class CatalogDO extends YjsRoom {
     return super.fetch(request);
   }
 
+  migrateDoc(doc, fromVersion) {
+    if (fromVersion < 1) doc.getMap("boards");
+  }
+
   /** Insert or update a board summary. Called by BoardDO on name/archive changes. */
   async handleUpsertBoard(request) {
     const body = await request.json();
@@ -58,6 +62,11 @@ export class CatalogDO extends YjsRoom {
       if (body.name !== undefined) entry.set("name", body.name);
       if (body.archived !== undefined) entry.set("archived", Boolean(body.archived));
     });
+
+    // BoardDO drops the retry row on 200. The catalog row has to be durable first.
+    if (!(await this.awaitPersisted())) {
+      return Response.json({ error: "Failed to persist" }, { status: 500 });
+    }
 
     return Response.json({ ok: true }, { status: created ? 201 : 200 });
   }

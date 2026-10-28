@@ -12,6 +12,7 @@ export const API = {
   board: (boardId) => `/api/boards/${id(boardId)}`,
   boardWs: (boardId) => `${wsBase()}/api/boards/${id(boardId)}/ws`,
   boardSnapshot: (boardId) => `/api/boards/${id(boardId)}/snapshot`,
+  boardExport: (boardId) => `/api/boards/${id(boardId)}/export`,
   boardMembers: (boardId) => `/api/boards/${id(boardId)}/members`,
   boardMember: (boardId, email) => `/api/boards/${id(boardId)}/members/${id(email)}`,
   boardInvites: (boardId) => `/api/boards/${id(boardId)}/invites`,

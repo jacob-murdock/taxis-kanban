@@ -155,7 +155,7 @@ async function moveCard(request, env, boardId, cardId, gate) {
     }
   }
 
-  const moveResponse = await boardStub(env, boardId).fetch(
+  return boardStub(env, boardId).fetch(
     jsonDoRequest(
       `/cards/${cardId}/move`,
       "POST",
@@ -163,16 +163,6 @@ async function moveCard(request, env, boardId, cardId, gate) {
       gate,
     ),
   );
-  if (!moveResponse.ok) return moveResponse;
-
-  const columnResponse = await jobStub(env, cardId).fetch(
-    jsonDoRequest("/column", "POST", { boardId, columnId: body.columnId }, gate),
-  );
-  if (!columnResponse.ok) {
-    return Response.json({ error: "Failed to update card column" }, { status: 500 });
-  }
-
-  return moveResponse;
 }
 
 async function archiveCard(request, env, boardId, cardId, gate) {

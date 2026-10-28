@@ -23,6 +23,7 @@ const errorEl = document.getElementById("page-error");
 const boardAccessEl = document.getElementById("board-access");
 const boardRoleEl = document.getElementById("board-role");
 const leaveBoardBtn = document.getElementById("leave-board-btn");
+const exportBoardBtn = document.getElementById("export-board-btn");
 const membersPanel = document.getElementById("members-panel");
 const membersList = document.getElementById("members-list");
 const inviteForm = document.getElementById("invite-form");
@@ -764,6 +765,89 @@ leaveBoardBtn?.addEventListener("click", () => {
   if (!myEmail) return;
   void removeMember(myEmail);
 });
+
+exportBoardBtn?.addEventListener("click", () => {
+  void downloadBoardExport();
+});
+
+function filenameFromDisposition(header, fallback) {
+  const match = /filename="([^"]+)"/.exec(header || "");
+  return match?.[1] || fallback;
+}
+
+async function downloadBoardExport() {
+  if (!boardId || !exportBoardBtn) return;
+  setError("");
+  exportBoardBtn.disabled = true;
+  try {
+    const cards = [];
+    const missingCardIds = [];
+    const seenCardIds = new Set();
+    let cursor = null;
+    let board = null;
+    let exportedAt = null;
+    let schemaVersion = null;
+    let filename = "board.json";
+    for (;;) {
+      const endpoint = new URL(API.boardExport(boardId), location.origin);
+      if (cursor) endpoint.searchParams.set("cursor", cursor);
+      const response = await fetch(endpoint, {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (response.status === 401) {
+        location.replace("/");
+        return;
+      }
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.error || `Export failed (${response.status})`);
+      }
+      if (!board) {
+        filename = filenameFromDisposition(response.headers.get("Content-Disposition"), filename);
+      }
+      const page = await response.json();
+      if (!Array.isArray(page.cards)) throw new Error("Export failed (missing cards)");
+      if (!board) {
+        if (!page.board) throw new Error("Export failed (missing board)");
+        board = page.board;
+        exportedAt = page.exportedAt;
+        schemaVersion = page.schemaVersion;
+      }
+      for (const card of page.cards) {
+        const id = typeof card?.id === "string" ? card.id : "";
+        if (id && seenCardIds.has(id)) continue;
+        if (id) seenCardIds.add(id);
+        cards.push(card);
+      }
+      if (Array.isArray(page.missingCardIds)) missingCardIds.push(...page.missingCardIds);
+      const next = typeof page.nextCursor === "string" ? page.nextCursor : "";
+      if (!next) break;
+      cursor = next;
+    }
+    const file = { exportedAt, schemaVersion, board, cards };
+    if (missingCardIds.length) file.missingCardIds = missingCardIds;
+    saveJsonDownload(file, filename);
+  } catch (err) {
+    setError(err.message);
+  } finally {
+    exportBoardBtn.disabled = false;
+  }
+}
+
+function saveJsonDownload(value, filename) {
+  const blob = new Blob([JSON.stringify(value)], {
+    type: "application/json;charset=utf-8",
+  });
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 1500);
+}
 
 async function bootstrap() {
   if (!boardId) {

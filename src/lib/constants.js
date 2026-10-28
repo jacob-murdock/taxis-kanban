@@ -1,11 +1,22 @@
-/** Debounce window before materializing a card snapshot into DO storage. */
-export const SNAPSHOT_ALARM_MS = 300_000;
-
 /** Fold the Yjs update log into one snapshot once it reaches this many rows. */
 export const YJS_COMPACT_EVERY = 50;
 
 /** Compact a shorter update log after the room has been idle this long. */
 export const YJS_COMPACT_ALARM_MS = 30_000;
+
+/**
+ * Schema version stored on each Yjs snapshot. Bump when migrateDoc changes.
+ * migrateDoc must bring every older doc all the way here; the snapshot is
+ * stamped with this value after it runs.
+ */
+export const DOC_SCHEMA_VERSION = 1;
+
+/** Keep this many newest changelog rows per card. */
+export const CHANGELOG_MAX_ENTRIES = 500;
+
+/** First retry delay for a failed cross-DO replica write; doubles each attempt. */
+export const OUTBOUND_BACKOFF_MS = 5_000;
+export const OUTBOUND_BACKOFF_MAX_MS = 300_000;
 
 export const BOARD_NAME_MAX = 80;
 export const COLUMN_NAME_MAX = 80;

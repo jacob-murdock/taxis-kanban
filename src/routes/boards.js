@@ -1,4 +1,4 @@
-import { BOARD_ID_RE, BOARD_NAME_MAX, COLUMN_ID_RE } from "../lib/constants.js";
+import { BOARD_ID_RE, BOARD_NAME_MAX, COLUMN_ID_RE, DOC_SCHEMA_VERSION } from "../lib/constants.js";
 import { readJson } from "../lib/json.js";
 import { generateBoardId } from "../lib/materialize.js";
 import { safeDecode } from "../lib/path.js";
@@ -8,6 +8,7 @@ import {
   boardStub,
   catalogStub,
   forwardToBoard,
+  jobStub,
   jsonDoRequest,
   requireRole,
   requireSession,
@@ -66,6 +67,11 @@ export async function routeApi(request, env, url) {
     if (gate.error) return gate.error;
     const response = await forwardToBoard(env, boardId, request, "/snapshot", null, gate);
     return withCallerRole(response, gate.role);
+  }
+  if (rest === "/export" && method === "GET") {
+    const gate = await requireRole(request, env, boardId, "viewer");
+    if (gate.error) return gate.error;
+    return exportBoard(env, boardId, url);
   }
   if (rest === "/columns" && method === "POST") {
     const gate = await requireRole(request, env, boardId, "editor");
@@ -223,6 +229,112 @@ async function renameColumn(request, env, boardId, columnId, gate) {
   return boardStub(env, boardId).fetch(
     jsonDoRequest(`/columns/${columnId}`, "PATCH", { name: body.name }, gate),
   );
+}
+
+/**
+ * Cards per export response. Each card is its own DO fetch, and flushing its
+ * changelog may write the summary back, so the page stays under the Worker
+ * subrequest cap. The client follows `nextCursor` and saves one file.
+ */
+const EXPORT_CARD_PAGE = 10;
+
+async function exportBoard(env, boardId, url) {
+  const snapshotResponse = await boardStub(env, boardId).fetch(
+    new Request("https://do.internal/snapshot", { method: "GET" }),
+  );
+  if (!snapshotResponse.ok) return snapshotResponse;
+  const board = await snapshotResponse.json();
+
+  const cardIds = exportCardIds(board);
+  const cursor = url.searchParams.get("cursor");
+  const parsed = Math.trunc(Number(cursor));
+  const start = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+
+  const chunk = cardIds.slice(start, start + EXPORT_CARD_PAGE);
+  const rows = await Promise.all(chunk.map((cardId) => fetchExportCard(env, boardId, cardId)));
+  const cards = [];
+  const missingCardIds = [];
+  for (let i = 0; i < chunk.length; i++) {
+    const row = rows[i];
+    if (row.error) {
+      return Response.json({ error: "Failed to export cards" }, { status: 502 });
+    }
+    if (row.missing) missingCardIds.push(chunk[i]);
+    else cards.push(row.card);
+  }
+
+  const nextCursor =
+    start + chunk.length < cardIds.length ? String(start + chunk.length) : null;
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    schemaVersion: DOC_SCHEMA_VERSION,
+  };
+  if (start === 0) payload.board = board;
+  payload.cards = cards;
+  if (missingCardIds.length) payload.missingCardIds = missingCardIds;
+  if (nextCursor) payload.nextCursor = nextCursor;
+
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${exportFilename(board.name, boardId)}"`,
+    },
+  });
+}
+
+async function fetchExportCard(env, boardId, cardId) {
+  try {
+    const response = await jobStub(env, cardId).fetch(
+      new Request("https://do.internal/export", { method: "GET" }),
+    );
+    if (response.status === 404) {
+      await response.body?.cancel();
+      return { missing: true };
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { error: true };
+    }
+    const card = await response.json();
+    if (card.boardId !== boardId) {
+      console.error(`Export skipped ${cardId}: it belongs to ${card.boardId || "no board"}`);
+      return { missing: true };
+    }
+    return { card };
+  } catch (err) {
+    console.error(`Export failed for ${cardId}`, err);
+    return { error: true };
+  }
+}
+
+/** Column order, then rank, then id. The cursor is an index into this id list. */
+function exportCardIds(board) {
+  const cards = board.cards && typeof board.cards === "object" ? board.cards : {};
+  const columnOrder = new Map(
+    (Array.isArray(board.columns) ? board.columns : []).map((column, index) => [
+      column?.id,
+      index,
+    ]),
+  );
+  return Object.keys(cards).sort((a, b) => {
+    const left = cards[a] || {};
+    const right = cards[b] || {};
+    const columnDelta =
+      (columnOrder.get(left.columnId) ?? 1e9) - (columnOrder.get(right.columnId) ?? 1e9);
+    if (columnDelta) return columnDelta;
+    const rankDelta = (Number(left.rank) || 0) - (Number(right.rank) || 0);
+    if (rankDelta) return rankDelta;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+}
+
+function exportFilename(name, boardId) {
+  const slug = String(name || "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return `${slug || boardId || "board"}.json`;
 }
 
 async function reorderColumns(request, env, boardId, gate) {

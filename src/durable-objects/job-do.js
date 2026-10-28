@@ -2,7 +2,7 @@ import * as Y from "yjs";
 import { YjsRoom } from "./yjs-room.js";
 import { createEmptyCardDoc, materializeCard } from "../lib/materialize.js";
 import { diffCardSnapshots } from "../lib/changelog.js";
-import { ROLE_RANK, SNAPSHOT_ALARM_MS } from "../lib/constants.js";
+import { CHANGELOG_MAX_ENTRIES, ROLE_RANK } from "../lib/constants.js";
 import { readJson } from "../lib/json.js";
 import {
   clampLabels,
@@ -14,7 +14,6 @@ import {
 } from "../lib/fields.js";
 
 const CHANGELOG_DEBOUNCE_MS = 400;
-const CARD_SNAPSHOT_ALARM = "card-snapshot";
 
 // Board-card summary fields; columnId and rank are owned by BoardDO placement.
 const SUMMARY_FIELDS = new Set(["title", "due", "assignee", "labels", "archived"]);
@@ -27,6 +26,8 @@ export class JobDO extends YjsRoom {
     this.changelogReady = false;
     this.lastSnapshot = null;
     this.changelogTimer = null;
+    /** In-flight flushChangelog promise, so export can wait for its rows. */
+    this.changelogFlight = null;
     this.suspendChangelog = false;
     /** Email for the in-flight debounce batch (flushed when the actor changes). */
     this.pendingActor = null;
@@ -41,6 +42,12 @@ export class JobDO extends YjsRoom {
     const doc = await super.ensureDoc();
     if (!this.changelogReady) {
       this.changelogReady = true;
+      // One-shot leftover: old card-snapshot key; drop once each JobDO has booted.
+      try {
+        await this.ctx.storage.delete("snapshot:latest");
+      } catch (err) {
+        console.error("Failed to drop legacy card snapshot", err);
+      }
       await this.initChangelogTable();
       this.lastSnapshot = materializeCard(doc);
       this.wireChangelog(doc);
@@ -63,7 +70,6 @@ export class JobDO extends YjsRoom {
     const onChange = () => {
       if (this.suspendChangelog) return;
       this.scheduleChangelog(this.pendingActor);
-      void this.scheduleSnapshotAlarm();
     };
     doc.getMap("fields").observeDeep(onChange);
     doc.getArray("labels").observe(onChange);
@@ -81,7 +87,9 @@ export class JobDO extends YjsRoom {
     if (this.changelogTimer) clearTimeout(this.changelogTimer);
     this.changelogTimer = setTimeout(() => {
       this.changelogTimer = null;
-      void this.flushChangelog(nextActor);
+      void this.flushChangelog(nextActor).catch((err) => {
+        console.error("Changelog flush failed", err);
+      });
     }, CHANGELOG_DEBOUNCE_MS);
   }
 
@@ -94,7 +102,31 @@ export class JobDO extends YjsRoom {
     await this.flushChangelog(previous);
   }
 
-  async flushChangelog(author) {
+  flushChangelog(author) {
+    const run = this.applyChangelog(author);
+    const tracked = run.finally(() => {
+      if (this.changelogFlight === tracked) this.changelogFlight = null;
+    });
+    this.changelogFlight = tracked;
+    return tracked;
+  }
+
+  /** Finish a debounced or in-flight batch so a reader sees those rows. */
+  async drainChangelog() {
+    for (let pass = 0; pass < 3; pass++) {
+      if (this.changelogFlight) {
+        await this.changelogFlight;
+        continue;
+      }
+      if (!this.changelogTimer) return;
+      const author = this.pendingActor || "system";
+      clearTimeout(this.changelogTimer);
+      this.changelogTimer = null;
+      await this.flushChangelog(author);
+    }
+  }
+
+  async applyChangelog(author) {
     if (this.suspendChangelog || !this.doc || !this.lastSnapshot) return;
     // Capture before the first await. A Durable Object can run another request
     // at that await, and this batch must keep the actor it already belongs to.
@@ -108,7 +140,16 @@ export class JobDO extends YjsRoom {
     await this.recordChanges(changes, credited);
 
     if (changes.some((c) => SUMMARY_FIELDS.has(c.field))) {
-      await this.syncCardToBoard(next);
+      // Don't publish a summary the card might forget if the Yjs write failed.
+      if (!(await this.awaitPersisted())) {
+        console.error(`Card summary skipped; persist failed for ${next.id}`);
+        return;
+      }
+      try {
+        await this.syncReplica("card-summary", summaryPayload(next));
+      } catch (err) {
+        console.error(`Card summary enqueue failed for ${next.id}`, err);
+      }
     }
   }
 
@@ -125,7 +166,10 @@ export class JobDO extends YjsRoom {
 
   /** Push summary fields to the board; leaves columnId and rank alone. */
   async syncCardToBoard(snapshot) {
-    if (!snapshot.id || !snapshot.boardId) return false;
+    if (!snapshot?.id || !snapshot.boardId) {
+      console.error("Card sync dropped: missing id or boardId");
+      return true;
+    }
     try {
       const stub = this.env.BOARD_DO.get(this.env.BOARD_DO.idFromName(snapshot.boardId));
       const response = await stub.fetch(
@@ -142,11 +186,7 @@ export class JobDO extends YjsRoom {
           }),
         }),
       );
-      if (!response.ok) {
-        console.error(`Card sync failed for ${snapshot.id}: ${response.status}`);
-        return false;
-      }
-      return true;
+      return this.settleOutboundResponse(response, `Card sync failed for ${snapshot.id}`);
     } catch (err) {
       console.error(`Card sync failed for ${snapshot.id}`, err);
       return false;
@@ -192,6 +232,10 @@ export class JobDO extends YjsRoom {
 
     if (request.method === "GET" && path.endsWith("/snapshot")) {
       return Response.json(materializeCard(this.doc));
+    }
+
+    if (request.method === "GET" && path.endsWith("/export")) {
+      return this.handleExport();
     }
 
     if (request.method === "GET" && path.endsWith("/history")) {
@@ -357,6 +401,10 @@ export class JobDO extends YjsRoom {
       this.doc.getMap("fields").set("columnId", body.columnId);
     });
     await this.flushChangelog(actor);
+    // BoardDO drops the retry row on 200. The column has to be durable first.
+    if (!(await this.awaitPersisted())) {
+      return Response.json({ error: "Failed to persist" }, { status: 500 });
+    }
 
     return Response.json({ ok: true });
   }
@@ -389,9 +437,14 @@ export class JobDO extends YjsRoom {
       this.suspendChangelog = false;
     }
 
-    const synced = await this.syncCardToBoard(next);
-    if (!synced) {
-      return Response.json({ error: "Failed to sync board" }, { status: 500 });
+    if (!(await this.awaitPersisted())) {
+      return Response.json({ error: "Failed to persist" }, { status: 500 });
+    }
+
+    try {
+      await this.syncReplica("card-summary", summaryPayload(next));
+    } catch (err) {
+      console.error(`Card summary enqueue failed for ${next.id}`, err);
     }
 
     return Response.json({ ok: true, archived: body.archived });
@@ -428,24 +481,44 @@ export class JobDO extends YjsRoom {
     return null;
   }
 
-  async scheduleSnapshotAlarm() {
-    await this.scheduleRoomAlarm(CARD_SNAPSHOT_ALARM, Date.now() + SNAPSHOT_ALARM_MS);
+  migrateDoc(doc, fromVersion) {
+    if (fromVersion < 1) {
+      const fields = doc.getMap("fields");
+      if (!fields.has("title")) fields.set("title", "Untitled");
+      if (!fields.has("archived")) fields.set("archived", false);
+      if (!fields.has("assignee")) fields.set("assignee", "");
+      if (!fields.has("due")) fields.set("due", null);
+      doc.getArray("labels");
+      doc.getText("body");
+    }
   }
 
-  async alarm() {
-    const due = await super.alarm();
-    if (!due.includes(CARD_SNAPSHOT_ALARM)) return;
-    if (await this.isTombstoned() || !(await this.isReady())) {
-      this.clearRoomAlarm(CARD_SNAPSHOT_ALARM);
-      await this.syncAlarmClock();
-      return;
+  async runOutboundSync(kind, payload) {
+    if (kind === "card-summary") return this.syncCardToBoard(payload);
+    console.error(`JobDO: unknown outbound kind ${kind}`);
+    return true;
+  }
+
+  async handleExport() {
+    try {
+      await this.drainChangelog();
+    } catch (err) {
+      console.error("Export changelog flush failed", err);
+      return Response.json({ error: "Failed to export card" }, { status: 500 });
     }
-    await this.ensureDoc();
-    const snapshot = materializeCard(this.doc);
-    await this.ctx.storage.put("snapshot:latest", snapshot);
-    this.clearRoomAlarm(CARD_SNAPSHOT_ALARM);
-    await this.syncAlarmClock();
-    console.log(`Card ${snapshot.id} snapshot materialized`);
+    await this.initChangelogTable();
+    const rows = await this.ctx.storage.sql
+      .exec("SELECT id, ts, author, field, prev, next FROM changelog ORDER BY id ASC")
+      .toArray();
+    const changelog = rows.map((row) => ({
+      id: Number(row.id),
+      ts: row.ts,
+      author: row.author,
+      field: row.field,
+      prev: row.prev,
+      next: row.next,
+    }));
+    return Response.json({ ...materializeCard(this.doc), changelog });
   }
 
   async handleHistoryRequest(url) {
@@ -492,6 +565,7 @@ export class JobDO extends YjsRoom {
         next TEXT
       )
     `);
+    this.trimChangelog();
   }
 
   async appendChangelog(entry) {
@@ -504,7 +578,27 @@ export class JobDO extends YjsRoom {
       entry.prev,
       entry.next,
     );
+    this.trimChangelog();
   }
+
+  trimChangelog() {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM changelog WHERE id < (SELECT id FROM changelog ORDER BY id DESC LIMIT 1 OFFSET ?)",
+      CHANGELOG_MAX_ENTRIES - 1,
+    );
+  }
+}
+
+function summaryPayload(snapshot) {
+  return {
+    id: snapshot.id,
+    boardId: snapshot.boardId,
+    title: snapshot.title,
+    due: snapshot.due,
+    assignee: snapshot.assignee,
+    labels: snapshot.labels,
+    archived: snapshot.archived,
+  };
 }
 
 function parseHistoryQuery(url) {

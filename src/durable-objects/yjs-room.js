@@ -1,13 +1,21 @@
 import * as Y from "yjs";
 import { DurableObject } from "cloudflare:workers";
-import { WS_CLOSE_REVOKED, YJS_COMPACT_ALARM_MS, YJS_COMPACT_EVERY } from "../lib/constants.js";
+import {
+  DOC_SCHEMA_VERSION,
+  OUTBOUND_BACKOFF_MAX_MS,
+  OUTBOUND_BACKOFF_MS,
+  WS_CLOSE_REVOKED,
+  YJS_COMPACT_ALARM_MS,
+  YJS_COMPACT_EVERY,
+} from "../lib/constants.js";
 
 const STORAGE_KEY_STATE = "ydoc:state";
 const STORAGE_KEY_READY = "ready";
 export const STORAGE_KEY_TOMBSTONE = "tombstone";
 
-/** Alarm kind: fold the update log. Other kinds (card snapshot) share this clock. */
+/** Alarm kind: fold the update log. Other kinds (outbound replicas) share this clock. */
 const ALARM_COMPACT = "yjs-compact";
+const ALARM_OUTBOUND = "outbound-sync";
 
 /**
  * Shared Yjs-over-WebSocket room logic for hibernatable Durable Objects.
@@ -24,6 +32,8 @@ export class YjsRoom extends DurableObject {
     this.schemaReady = false;
     /** Serializes update inserts so compaction cannot drop a write still in flight. */
     this.persistTail = Promise.resolve();
+    /** Serializes replica sends so an older in-flight write cannot clobber a newer one. */
+    this.outboundTail = Promise.resolve();
   }
 
   /** Load the doc once; concurrent callers share the same promise. */
@@ -39,11 +49,13 @@ export class YjsRoom extends DurableObject {
     this.ensureSchema();
     const legacy = await this.ctx.storage.get(STORAGE_KEY_STATE);
     const snap = this.ctx.storage.sql
-      .exec("SELECT state FROM yjs_snapshot WHERE id = 1")
+      .exec("SELECT state, schema_version FROM yjs_snapshot WHERE id = 1")
       .toArray()[0];
     const updates = this.ctx.storage.sql
       .exec("SELECT bytes FROM yjs_updates ORDER BY id")
       .toArray();
+
+    const fromVersion = snap?.schema_version != null ? Number(snap.schema_version) : 0;
 
     this.doc = new Y.Doc();
     const base = snap?.state != null ? snap.state : legacy;
@@ -61,9 +73,23 @@ export class YjsRoom extends DurableObject {
       this.doc = this.options.createDoc();
     }
 
-    // Old rooms stored one full encode on `ydoc:state`. Fold that into the snapshot
-    // once; a later load must not apply the legacy blob on top of the snapshot.
-    if (legacy != null && snap?.state == null) {
+    const needsMigrate = hasState && fromVersion < DOC_SCHEMA_VERSION;
+    let migrationUpdate = null;
+    if (needsMigrate) {
+      const before = Y.encodeStateVector(this.doc);
+      this.doc.transact(() => {
+        this.migrateDoc(this.doc, fromVersion);
+      });
+      if (!sameBytes(before, Y.encodeStateVector(this.doc))) {
+        // Hibernated sockets already have the pre-migration doc. The listener
+        // is not attached yet, so this diff is not stored a second time.
+        migrationUpdate = Y.encodeStateAsUpdate(this.doc, before);
+      }
+    }
+
+    // Fold a legacy blob, or rewrite after migrate, before the update listener exists.
+    const needsRewrite = (legacy != null && snap?.state == null) || needsMigrate;
+    if (needsRewrite) {
       this.ctx.storage.transactionSync(() => {
         this.writeSnapshotFromDoc(null);
       });
@@ -80,19 +106,32 @@ export class YjsRoom extends DurableObject {
       }
     });
 
+    if (migrationUpdate) sendToPeers(this.ctx, migrationUpdate);
+
     if (this.pendingUpdateCount() > 0) {
       await this.scheduleRoomAlarm(ALARM_COMPACT, Date.now() + YJS_COMPACT_ALARM_MS);
     }
+    await this.scheduleOutboundAlarm();
 
     return this.doc;
   }
+
+  /**
+   * Bring a loaded doc from `fromVersion` up to DOC_SCHEMA_VERSION.
+   * Runs inside a transaction before the update listener is attached.
+   * Connected sockets receive a diff when the doc actually changes.
+   * Subclasses override; default is a no-op. Step every older version
+   * forward — the caller stamps the snapshot with DOC_SCHEMA_VERSION.
+   */
+  migrateDoc(_doc, _fromVersion) {}
 
   ensureSchema() {
     if (this.schemaReady) return;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS yjs_snapshot (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        state BLOB NOT NULL
+        state BLOB NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS yjs_updates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,8 +141,38 @@ export class YjsRoom extends DurableObject {
         kind TEXT PRIMARY KEY,
         at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS outbound_sync (
+        kind TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        gen INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_at INTEGER NOT NULL
+      );
     `);
+    // One-shot leftover: tables created before schema_version existed.
+    this.ensureColumn("yjs_snapshot", "schema_version", "INTEGER NOT NULL DEFAULT 0");
+    // Drop alarms this process no longer handles (the old card snapshot clock).
+    // A past row left behind is the soonest deadline and the DO alarm spins.
+    this.ctx.storage.sql.exec(
+      "DELETE FROM room_alarms WHERE kind NOT IN (?, ?)",
+      ALARM_COMPACT,
+      ALARM_OUTBOUND,
+    );
     this.schemaReady = true;
+  }
+
+  ensureColumn(table, column, spec) {
+    try {
+      const rows = this.ctx.storage.sql.exec(`PRAGMA table_info(${table})`).toArray();
+      if (rows.some((row) => String(row.name) === column)) return;
+    } catch {
+      // PRAGMA unavailable; try ALTER and ignore a duplicate-column error.
+    }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${spec}`);
+    } catch {
+      // Column already present.
+    }
   }
 
   pendingUpdateCount() {
@@ -122,10 +191,12 @@ export class YjsRoom extends DurableObject {
    */
   writeSnapshotFromDoc(maxId) {
     if (!this.doc) return;
+    this.ensureSchema();
     const state = Y.encodeStateAsUpdate(this.doc);
     this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO yjs_snapshot (id, state) VALUES (1, ?)",
+      "INSERT OR REPLACE INTO yjs_snapshot (id, state, schema_version) VALUES (1, ?, ?)",
       state,
+      DOC_SCHEMA_VERSION,
     );
     if (maxId == null) {
       this.ctx.storage.sql.exec("DELETE FROM yjs_updates");
@@ -142,6 +213,35 @@ export class YjsRoom extends DurableObject {
     const run = this.persistTail.catch(() => {}).then(() => task());
     this.persistTail = run;
     return run;
+  }
+
+  /**
+   * Wait until Yjs writes queued so far have finished. False means a replica
+   * ack must fail so the retry row stays: a 200 would drop it.
+   * When the latest write failed and nothing newer is queued, fold memory
+   * into one snapshot so a retry can succeed without a fresh update.
+   */
+  async awaitPersisted() {
+    const tail = this.persistTail;
+    try {
+      await tail;
+    } catch (err) {
+      console.error("Yjs persist failed", err);
+      if (this.tombstoned || !this.doc || this.persistTail !== tail) return false;
+      try {
+        this.ensureSchema();
+        this.ctx.storage.transactionSync(() => {
+          this.writeSnapshotFromDoc(null);
+          this.ctx.storage.sql.exec("DELETE FROM room_alarms WHERE kind = ?", ALARM_COMPACT);
+        });
+        if (this.persistTail === tail) this.persistTail = Promise.resolve();
+        return true;
+      } catch (snapErr) {
+        console.error("Yjs snapshot fallback failed", snapErr);
+        return false;
+      }
+    }
+    return !this.tombstoned;
   }
 
   /** Append one Yjs update. Compacts when the log reaches YJS_COMPACT_EVERY. */
@@ -220,7 +320,7 @@ export class YjsRoom extends DurableObject {
 
   /**
    * Remember a deadline. A Durable Object has one alarm, so the clock is always
-   * the soonest row in `room_alarms` (Yjs compaction and the card snapshot).
+   * the soonest row in `room_alarms` (Yjs compaction and outbound replicas).
    * An existing future deadline for `kind` is kept when it is sooner.
    */
   upsertRoomAlarm(kind, when) {
@@ -285,7 +385,7 @@ export class YjsRoom extends DurableObject {
 
   /**
    * Compact when this wake is the compaction alarm, or when another alarm
-   * (card snapshot) finds a log waiting. Returns the kinds that were due.
+   * (outbound retry) finds a log waiting. Returns the kinds that were due.
    */
   async alarm() {
     if (await this.isTombstoned()) return [];
@@ -308,8 +408,195 @@ export class YjsRoom extends DurableObject {
       });
     }
 
+    if (due.includes(ALARM_OUTBOUND) || this.hasDueOutbound(now)) {
+      await this.flushOutbound();
+    }
+
     await this.syncAlarmClock();
     return due;
+  }
+
+  /**
+   * Store `payload` as the latest replica write for `kind` and send it now.
+   * Callers still succeed locally if the replica fails: the row stays and the
+   * outbound alarm retries with backoff. 4xx responses are dropped, except
+   * 408 and 429. The alarm is armed before the send so a crash mid-fetch
+   * still wakes the retry.
+   */
+  async syncReplica(kind, payload) {
+    if (this.tombstoned) return;
+    this.writeOutbound(kind, JSON.stringify(payload));
+    try {
+      await this.scheduleRoomAlarm(ALARM_OUTBOUND, Date.now() + OUTBOUND_BACKOFF_MS);
+    } catch (err) {
+      console.error(`Outbound alarm failed for ${kind}`, err);
+    }
+    if (this.tombstoned) return;
+    await this.enqueueOutboundFlush(kind);
+  }
+
+  /** Subclasses send `payload` to the replica. Return true to drop the row. */
+  async runOutboundSync(_kind, _payload) {
+    return true;
+  }
+
+  writeOutbound(kind, payloadJson) {
+    this.ensureSchema();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO outbound_sync (kind, payload, gen, attempts, next_at)
+       VALUES (?, ?, 1, 0, ?)
+       ON CONFLICT(kind) DO UPDATE SET
+         payload = excluded.payload,
+         gen = outbound_sync.gen + 1,
+         attempts = 0,
+         next_at = excluded.next_at`,
+      kind,
+      payloadJson,
+      Date.now(),
+    );
+    const row = this.ctx.storage.sql
+      .exec("SELECT gen FROM outbound_sync WHERE kind = ?", kind)
+      .toArray()[0];
+    return Number(row?.gen ?? 1);
+  }
+
+  getOutbound(kind) {
+    return (
+      this.ctx.storage.sql
+        .exec(
+          "SELECT kind, payload, gen, attempts, next_at FROM outbound_sync WHERE kind = ?",
+          kind,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  clearOutbound(kind) {
+    this.ctx.storage.sql.exec("DELETE FROM outbound_sync WHERE kind = ?", kind);
+  }
+
+  clearOutboundIf(kind, gen) {
+    this.ctx.storage.sql.exec("DELETE FROM outbound_sync WHERE kind = ? AND gen = ?", kind, gen);
+  }
+
+  bumpOutbound(kind) {
+    const row = this.getOutbound(kind);
+    if (!row) return;
+    const attempts = Number(row.attempts) + 1;
+    this.ctx.storage.sql.exec(
+      "UPDATE outbound_sync SET attempts = ?, next_at = ? WHERE kind = ?",
+      attempts,
+      Date.now() + outboundBackoffMs(attempts),
+      kind,
+    );
+  }
+
+  hasDueOutbound(now = Date.now()) {
+    const row = this.ctx.storage.sql
+      .exec("SELECT 1 AS ok FROM outbound_sync WHERE next_at <= ? LIMIT 1", now)
+      .toArray()[0];
+    return row != null;
+  }
+
+  enqueueOutboundFlush(kind) {
+    const run = this.outboundTail.catch(() => {}).then(() => this.flushOutboundKind(kind));
+    this.outboundTail = run;
+    return run;
+  }
+
+  async flushOutboundKind(kind) {
+    try {
+      if (this.tombstoned) return;
+      let row = this.getOutbound(kind);
+      while (row && !this.tombstoned) {
+        if (Number(row.next_at) > Date.now()) return;
+        const gen = Number(row.gen);
+        let payload;
+        try {
+          payload = JSON.parse(String(row.payload));
+        } catch {
+          this.clearOutbound(kind);
+          return;
+        }
+        let ok = false;
+        try {
+          ok = await this.runOutboundSync(kind, payload);
+        } catch (err) {
+          console.error(`Outbound ${kind} threw`, err);
+          ok = false;
+        }
+        if (this.tombstoned) return;
+        let current;
+        try {
+          current = this.getOutbound(kind);
+        } catch (err) {
+          if (this.tombstoned) return;
+          throw err;
+        }
+        if (!current) return;
+        if (Number(current.gen) !== gen) {
+          row = current;
+          continue;
+        }
+        if (ok) {
+          this.clearOutboundIf(kind, gen);
+          return;
+        }
+        this.bumpOutbound(kind);
+        return;
+      }
+    } finally {
+      await this.scheduleOutboundAlarm();
+    }
+  }
+
+  async flushOutbound() {
+    if (this.tombstoned) return;
+    this.ensureSchema();
+    const rows = this.ctx.storage.sql
+      .exec("SELECT kind FROM outbound_sync WHERE next_at <= ?", Date.now())
+      .toArray();
+    for (const row of rows) {
+      await this.enqueueOutboundFlush(String(row.kind));
+    }
+    await this.scheduleOutboundAlarm();
+  }
+
+  /**
+   * Point the outbound alarm at MIN(next_at). Unlike upsertRoomAlarm this
+   * replaces a sooner stale deadline after backoff.
+   */
+  async scheduleOutboundAlarm() {
+    if (this.tombstoned) return;
+    this.ensureSchema();
+    const row = this.ctx.storage.sql
+      .exec("SELECT MIN(next_at) AS at FROM outbound_sync")
+      .toArray()[0];
+    this.clearRoomAlarm(ALARM_OUTBOUND);
+    if (row?.at != null) this.upsertRoomAlarm(ALARM_OUTBOUND, Number(row.at));
+    await this.syncAlarmClock();
+  }
+
+  /**
+   * 2xx succeeds. 4xx is dropped (retry will not help). 5xx and network errors retry.
+   */
+  async settleOutboundResponse(response, label) {
+    if (response.ok) {
+      await response.body?.cancel();
+      return true;
+    }
+    const { status } = response;
+    await response.body?.cancel();
+    if (status === 408 || status === 429) {
+      console.error(`${label}: ${status}`);
+      return false;
+    }
+    if (status >= 400 && status < 500) {
+      console.error(`${label}: ${status} (dropping)`);
+      return true;
+    }
+    console.error(`${label}: ${status}`);
+    return false;
   }
 
   async fetch(request) {
@@ -392,6 +679,27 @@ export class YjsRoom extends DurableObject {
   async webSocketClose(_ws, _code, _reason, _wasClean) {
     // Hibernatable — no cleanup needed for stateless relay.
   }
+}
+
+function sendToPeers(ctx, update) {
+  for (const peer of ctx.getWebSockets()) {
+    try {
+      peer.send(update);
+    } catch {
+      /* already closing */
+    }
+  }
+}
+
+function sameBytes(a, b) {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function outboundBackoffMs(attempts) {
+  const exp = Math.min(Math.max(attempts, 1) - 1, 8);
+  return Math.min(OUTBOUND_BACKOFF_MS * 2 ** exp, OUTBOUND_BACKOFF_MAX_MS);
 }
 
 /** SQLite blobs come back as ArrayBuffer. Copy views so the binding stores just the update. */

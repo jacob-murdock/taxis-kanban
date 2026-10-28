@@ -13,7 +13,8 @@ Make as many boards as you like, each with its own columns. Everyone on a board 
 - **Board list.** Create, rename, archive and restore boards you belong to.
 - **Live boards.** New boards start with To do / Doing / Done. Add, rename, reorder and delete columns, then drag cards within or between columns. Every open copy of the board updates.
 - **Live card pages.** Title, assignee, due date and labels are shared fields. The body is a shared text document that merges character by character, so two people typing in different places don't overwrite each other.
-- **Change history.** Every card edit is recorded with author, old and new value, and shown on the card page.
+- **Change history.** Every card edit is recorded with author, old and new value, and shown on the card page. Each card keeps the newest 500 entries.
+- **Board export.** Download one JSON dump of the board, its materialized cards, and each card's changelog. A large board is read a page of cards at a time.
 - **Archive and delete.** Archived cards leave their column and can be restored. Deleted cards are tombstoned, so a stale client can't bring them back.
 - **Reconnects on its own.** Clients reconnect with backoff and resync on arrival. Logout, a removed membership, or a role change closes that person's live sockets. A role change reloads the page if you still belong.
 - **No build framework.** The client is plain HTML, CSS and ES modules. Yjs is bundled locally by esbuild, so nothing loads from a CDN.
@@ -30,10 +31,10 @@ browser ──cookie + HTTP /api/*──▶ Worker ──▶ AuthDO     (one: li
 
 - **Worker** (`src/index.js`, `src/routes/`) validates sessions and roles, routes `/api/*` and WebSocket upgrades to the right Durable Object, strips client-supplied actor headers and sets trusted identity, and serves `app/` as static assets. Signed-out visitors to a well-formed `/b/…` path are sent to sign in (the same redirect whether or not that board exists). Signed-in non-members get the same `404.html` as a missing board.
 - **AuthDO** is a singleton (`idFromName("auth")`). It stores magic-link hashes, a per-email session generation counter (logout bumps it), memberships, invites, and rate limits. At this scale one AuthDO hit per gated request is fine.
-- **YjsRoom** (`src/durable-objects/yjs-room.js`) is the shared base. It owns one `Y.Doc`, accepts [hibernatable WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), and sends each new client the full state. Each change is appended to a SQLite update log and folded into a snapshot every 50 updates or 30 seconds after the first unfolded one, so a single edit does not rewrite the whole document. A Durable Object has one alarm; that clock is the soonest of Yjs compaction and the card snapshot. Socket attachments carry `{email, role}` for authorship and revoke.
-- **CatalogDO** holds the board list (id, name, archived, created time). BoardDO keeps it in sync. The Worker filters the catalog snapshot to the caller's memberships.
-- **BoardDO** holds one board: its name, an ordered array of columns, and a map of card summaries (title, column, rank, assignee, due, labels, archived).
-- **JobDO** holds one card document: a map of fields plus a `Y.Text` body and a labels array. A debounced observer diffs each change against the last snapshot, writes it to a `changelog` table (with the actor's email), and pushes summary fields to BoardDO. Viewer sockets are read-only: inbound updates are dropped.
+- **YjsRoom** (`src/durable-objects/yjs-room.js`) is the shared base. It owns one `Y.Doc`, accepts [hibernatable WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), and sends each new client the full state. Each change is appended to a SQLite update log and folded into a snapshot every 50 updates or 30 seconds after the first unfolded one, so a single edit does not rewrite the whole document. The snapshot row stores a schema version; `ensureDoc` runs `migrateDoc` when a room is behind. A Durable Object has one alarm; that clock is the soonest of Yjs compaction and outbound replica retries. Socket attachments carry `{email, role}` for authorship and revoke.
+- **CatalogDO** holds the board list (id, name, archived, created time). BoardDO keeps it in sync and retries a failed upsert via the outbound alarm. The Worker filters the catalog snapshot to the caller's memberships.
+- **BoardDO** holds one board: its name, an ordered array of columns, and a map of card summaries (title, column, rank, assignee, due, labels, archived). Placement (column and rank) lives here; a move also copies `columnId` onto the card and retries if that write fails.
+- **JobDO** holds one card document: a map of fields plus a `Y.Text` body and a labels array. A debounced observer diffs each change against the last snapshot, writes it to a `changelog` table (with the actor's email, capped at 500 rows), and pushes summary fields to BoardDO with the same retry. Viewer sockets are read-only: inbound updates are dropped.
 
 **Who writes what.** The board socket is read-only. Board and column changes, card creation, moves, archive and delete all go over HTTP and require editor (or owner where noted). The card socket is writable for editors and owners; viewers subscribe only. The server reverts protected keys (`id`, `boardId`, `columnId`) and clamps field lengths.
 
@@ -76,6 +77,7 @@ A board with no owner membership fails closed. Creating a board makes you the ow
 | `/api/boards/:board` | PATCH `{name?, archived?}` | owner | Rename or archive |
 | `/api/boards/:board/ws` | GET (upgrade) | viewer | Board Yjs room (read-only) |
 | `/api/boards/:board/snapshot` | GET | viewer | Board JSON + caller's `role` |
+| `/api/boards/:board/export` | GET | viewer | JSON dump: board, cards, changelogs. `?cursor=` is the next page of cards |
 | `/api/boards/:board/columns` | POST `{name}` | editor | Add a column |
 | `/api/boards/:board/columns/order` | POST `{ids}` | editor | Reorder columns |
 | `/api/boards/:board/columns/:column` | PATCH `{name}` / DELETE | editor | Rename, or delete an empty column |

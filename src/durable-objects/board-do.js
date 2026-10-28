@@ -131,22 +131,25 @@ export class BoardDO extends YjsRoom {
     }
 
     await this.ensureDoc();
+    const createdAt = new Date().toISOString();
     this.doc.transact(() => {
       const meta = this.doc.getMap("meta");
       meta.set("id", body.id);
       meta.set("name", name);
       meta.set("archived", false);
+      meta.set("createdAt", createdAt);
     });
     await this.markReady();
 
-    const synced = await this.syncToCatalog({
-      id: body.id,
-      name,
-      archived: false,
-      createdAt: new Date().toISOString(),
-    });
-    if (!synced) {
-      return Response.json({ error: "Failed to sync catalog" }, { status: 500 });
+    try {
+      await this.syncReplica("catalog", {
+        id: body.id,
+        name,
+        archived: false,
+        createdAt,
+      });
+    } catch (err) {
+      console.error(`Catalog enqueue failed for ${body.id}`, err);
     }
 
     return Response.json({ ok: true, id: body.id, name }, { status: 201 });
@@ -179,13 +182,15 @@ export class BoardDO extends YjsRoom {
       if (typeof body.archived === "boolean") meta.set("archived", body.archived);
     });
 
-    const synced = await this.syncToCatalog({
-      id,
-      name: meta.get("name"),
-      archived: Boolean(meta.get("archived")),
-    });
-    if (!synced) {
-      return Response.json({ error: "Failed to sync catalog" }, { status: 500 });
+    try {
+      await this.syncReplica("catalog", {
+        id,
+        name: meta.get("name"),
+        archived: Boolean(meta.get("archived")),
+        createdAt: meta.get("createdAt"),
+      });
+    } catch (err) {
+      console.error(`Catalog enqueue failed for ${id}`, err);
     }
 
     return Response.json({
@@ -362,6 +367,20 @@ export class BoardDO extends YjsRoom {
       return Response.json({ error: placed.error }, { status: placed.status });
     }
 
+    const boardId = this.doc.getMap("meta").get("id");
+    if (boardId) {
+      try {
+        await this.syncReplica(`job-column:${cardId}`, {
+          cardId,
+          boardId,
+          columnId,
+          actor: request.headers.get("X-TK-Actor") || "system",
+        });
+      } catch (err) {
+        console.error(`Job column enqueue failed for ${cardId}`, err);
+      }
+    }
+
     return Response.json({ ok: true, id: cardId, columnId, rank: placed.rank });
   }
 
@@ -441,8 +460,38 @@ export class BoardDO extends YjsRoom {
     this.doc.transact(() => {
       applyCardSummaryToYMap(card, body);
     });
+    // JobDO drops the retry row on 200. The summary has to be durable first.
+    if (!(await this.awaitPersisted())) {
+      return Response.json({ error: "Failed to persist" }, { status: 500 });
+    }
 
     return Response.json({ ok: true });
+  }
+
+  migrateDoc(doc, fromVersion) {
+    if (fromVersion < 1) {
+      const meta = doc.getMap("meta");
+      if (!meta.has("name")) meta.set("name", "Untitled board");
+      if (!meta.has("archived")) meta.set("archived", false);
+      doc.getArray("columns");
+      const cards = doc.getMap("cards");
+      cards.forEach((value) => {
+        if (!(value instanceof Y.Map)) return;
+        if (!value.has("title")) value.set("title", "Untitled");
+        if (!value.has("archived")) value.set("archived", false);
+        if (!value.has("rank")) value.set("rank", 0);
+        if (!value.has("assignee")) value.set("assignee", "");
+        if (!value.has("due")) value.set("due", null);
+        if (!value.has("labels")) value.set("labels", []);
+      });
+    }
+  }
+
+  async runOutboundSync(kind, payload) {
+    if (kind === "catalog") return this.syncToCatalog(payload);
+    if (kind.startsWith("job-column:")) return this.syncColumnToJob(payload);
+    console.error(`BoardDO: unknown outbound kind ${kind}`);
+    return true;
   }
 
   cardsInColumn(columnId) {
@@ -465,9 +514,33 @@ export class BoardDO extends YjsRoom {
           body: JSON.stringify(summary),
         }),
       );
-      return response.ok;
+      return this.settleOutboundResponse(response, `Catalog sync failed for ${summary.id}`);
     } catch (err) {
       console.error(`Catalog sync failed for ${summary.id}`, err);
+      return false;
+    }
+  }
+
+  async syncColumnToJob(payload) {
+    const { cardId, boardId, columnId, actor } = payload;
+    if (!cardId || !boardId || !columnId) {
+      console.error("Job column sync dropped: missing cardId, boardId, or columnId");
+      return true;
+    }
+    try {
+      const stub = this.env.JOB_DO.get(this.env.JOB_DO.idFromName(cardId));
+      const headers = { "Content-Type": "application/json" };
+      if (actor) headers["X-TK-Actor"] = actor;
+      const response = await stub.fetch(
+        new Request("https://do.internal/column", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ boardId, columnId }),
+        }),
+      );
+      return this.settleOutboundResponse(response, `Job column sync failed for ${cardId}`);
+    } catch (err) {
+      console.error(`Job column sync failed for ${cardId}`, err);
       return false;
     }
   }
