@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
+  <a class="skip-link" href="#content">Skip to boards</a>
   <header class="site-header">
     <h1>Taxis Kanban</h1>
     <p class="tagline">Boards</p>
@@ -15,9 +16,12 @@
     <p id="page-error" class="page-error" role="alert"></p>
   </header>
 
-  <main class="stack">
+  <main id="content" class="stack" tabindex="-1">
     <form id="create-board-form" class="create-board" hidden>
-      <input id="new-board-name" type="text" name="name" maxlength="80" required placeholder="Board name" aria-label="Board name" autocomplete="off">
+      <label class="field-label">
+        Board name
+        <input id="new-board-name" type="text" name="name" maxlength="80" required autocomplete="off">
+      </label>
       <button type="submit" class="btn-primary">Create</button>
     </form>
     <label class="show-archived" hidden>
@@ -30,7 +34,7 @@
   </main>
 
   <footer class="site-footer">
-    <p id="connection-status" class="connection-status" data-state="connecting">Connecting…</p>
+    <p id="connection-status" class="connection-status" role="status" data-state="connecting">Connecting…</p>
   </footer>
 
   <script type="module" src="/js/auth.js"></script>

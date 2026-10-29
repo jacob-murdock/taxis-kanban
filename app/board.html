@@ -8,9 +8,10 @@
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
+  <a class="skip-link" href="#board">Skip to board</a>
   <header class="site-header">
     <nav><a href="/">← Boards</a></nav>
-    <h1 id="board-name" spellcheck="true" aria-label="Board name">Loading…</h1>
+    <h1 id="board-name" spellcheck="true">Loading…</h1>
     <p id="archived-banner" class="banner" hidden>
       This board is archived.
       <button type="button" id="unarchive-btn" class="btn">Unarchive</button>
@@ -43,22 +44,25 @@
   </section>
 
   <div class="board-wrap">
-    <main id="board" class="board" aria-label="Kanban board"></main>
+    <main id="board" class="board" tabindex="-1" aria-label="Kanban board"></main>
     <form id="add-column-form" class="add-column" hidden>
       <h2>New column</h2>
-      <input id="new-column-name" type="text" maxlength="80" placeholder="Column name" aria-label="New column name" autocomplete="off">
+      <label for="new-column-name">Column name</label>
+      <input id="new-column-name" type="text" maxlength="80" autocomplete="off">
       <button type="submit" class="btn">Add</button>
     </form>
   </div>
 
   <section id="archived-strip" class="archived-strip" hidden>
-    <h2>Archived</h2>
-    <ul id="archived-list" class="card-list"></ul>
+    <h2 id="archived-heading">Archived</h2>
+    <ul id="archived-list" class="card-list" aria-labelledby="archived-heading"></ul>
   </section>
 
   <footer class="site-footer">
-    <p id="connection-status" class="connection-status" data-state="connecting">Connecting…</p>
+    <p id="connection-status" class="connection-status" role="status" data-state="connecting">Connecting…</p>
     <div id="presence" class="presence" hidden></div>
+    <div id="activity-log" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+    <p id="board-keys" class="visually-hidden" hidden>When a card title is focused, arrow keys move that card. Each card also has a Move button.</p>
   </footer>
 
   <script type="module" src="/js/board.js"></script>

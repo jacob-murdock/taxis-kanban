@@ -9,14 +9,15 @@
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
+  <a class="skip-link" href="#content">Skip to invite</a>
   <header class="site-header">
     <nav><a href="/">← Boards</a></nav>
     <h1>Board invite</h1>
     <p id="page-error" class="page-error" role="alert"></p>
   </header>
 
-  <main class="stack invite-panel">
-    <p id="invite-status" class="tagline">Checking invite…</p>
+  <main id="content" class="stack invite-panel" tabindex="-1">
+    <p id="invite-status" class="tagline" role="status">Checking invite…</p>
     <button type="button" id="accept-btn" class="btn-primary" hidden>Accept invite</button>
   </main>
 

@@ -2,7 +2,11 @@
  * every change is an HTTP request, and the next server update redraws the board.
  */
 
+import { announce } from "./announce.js";
+import { planCardNudge, planMoveToColumn } from "./card-nudge.js";
+import { describeBoardChanges } from "./change-summary.js";
 import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
+import { COLUMN_TITLE_HINT, BOARD_TITLE_HINT, setTitleEditing } from "./editable-title.js";
 import { rememberSession } from "./local-session.js";
 import { bindPresence } from "./presence.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
@@ -34,6 +38,7 @@ const inviteRoleEl = document.getElementById("invite-role");
 const inviteLinkRow = document.getElementById("invite-link-row");
 const inviteLinkEl = document.getElementById("invite-link");
 const copyInviteBtn = document.getElementById("copy-invite-btn");
+const boardKeysEl = document.getElementById("board-keys");
 
 let doc = null;
 let missing = false;
@@ -41,6 +46,12 @@ let rendering = false;
 let renderPending = false;
 let dragCardId = null;
 let suppressClick = false;
+let renderedBoard = null;
+let openMenu = null;
+let moveQueue = Promise.resolve();
+let focusAfterRender = null;
+const ARROW_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
+const COLUMN_ACTIONS = new Set(["move-left", "move-right", "delete-column"]);
 let myRole = null;
 let myEmail = null;
 let room = null;
@@ -57,6 +68,17 @@ function isOwner() {
 
 function oneLine(value, max) {
   return value.replace(/[\r\n]+/g, " ").trim().slice(0, max);
+}
+
+function spoken(value, fallback) {
+  const trimmed = String(value ?? "").trim();
+  return trimmed || fallback;
+}
+
+function setBoardKeys(on) {
+  if (boardKeysEl) boardKeysEl.hidden = !on;
+  if (on) boardEl.setAttribute("aria-describedby", "board-keys");
+  else boardEl.removeAttribute("aria-describedby");
 }
 
 function setError(message) {
@@ -120,8 +142,9 @@ function cardHref(cardId) {
 function renderFromDoc() {
   if (!doc || missing) return;
   // Replacing the dragged card detaches it, so dragend never reaches us and
-  // clicks stay suppressed. Hold the redraw until the drag finishes.
-  if (dragCardId || rendering) {
+  // clicks stay suppressed. An open Move menu would close the same way.
+  // Hold the redraw until that gesture finishes.
+  if (dragCardId || openMenu || rendering) {
     renderPending = true;
     return;
   }
@@ -129,6 +152,10 @@ function renderFromDoc() {
   renderPending = false;
   const ui = captureUi();
   const board = readBoard(doc);
+  if (renderedBoard) {
+    for (const note of describeBoardChanges(renderedBoard, board)) announce(note);
+  }
+  renderedBoard = board;
 
   if (document.activeElement !== boardNameEl) {
     boardNameEl.textContent = board.name || "Untitled board";
@@ -156,30 +183,30 @@ function renderColumn(column, cards, index, count) {
   const head = document.createElement("div");
   head.className = "column-head";
 
+  const columnName = spoken(column.name, "Untitled column");
   const heading = document.createElement("h2");
+  heading.id = `column-title-${column.id}`;
   heading.dataset.columnName = "";
-  if (editable) {
-    heading.contentEditable = "plaintext-only";
-    heading.spellcheck = true;
-  }
-  heading.setAttribute("aria-label", "Column name");
   heading.textContent = column.name;
-
   head.append(heading);
+  setTitleEditing(heading, editable, COLUMN_TITLE_HINT);
   if (editable) {
     const actions = document.createElement("div");
     actions.className = "column-actions";
     actions.append(
-      iconButton("move-left", "Move column left", "←", index === 0),
-      iconButton("move-right", "Move column right", "→", index === count - 1),
-      iconButton("delete-column", "Delete column", "✕", false),
+      iconButton("move-left", `Move ${columnName} left`, "←", index === 0),
+      iconButton("move-right", `Move ${columnName} right`, "→", index === count - 1),
+      iconButton("delete-column", `Delete ${columnName}`, "✕", false),
     );
     head.append(actions);
   }
 
   const list = document.createElement("ul");
   list.className = "card-list";
-  for (const card of cards) list.append(buildCardEl(card));
+  list.setAttribute("aria-labelledby", heading.id);
+  cards.forEach((card, cardIndex) => {
+    list.append(buildCardEl(card, { index: cardIndex, count: cards.length, columnName }));
+  });
 
   section.append(head, list);
 
@@ -190,22 +217,28 @@ function renderColumn(column, cards, index, count) {
     const input = document.createElement("input");
     input.type = "text";
     input.maxLength = TITLE_MAX;
-    input.placeholder = "Card title";
-    input.setAttribute("aria-label", `Add a card to ${column.name}`);
     input.dataset.composerInput = "";
     input.autocomplete = "off";
+    const field = document.createElement("label");
+    field.className = "field-label";
+    field.append(document.createTextNode("Card title"));
+    const where = document.createElement("span");
+    where.className = "visually-hidden";
+    where.textContent = ` in ${columnName}`;
+    field.append(where, input);
     const add = document.createElement("button");
     add.type = "submit";
     add.className = "btn";
     add.textContent = "Add";
-    form.append(input, add);
+    add.setAttribute("aria-label", `Add a card to ${columnName}`);
+    form.append(field, add);
     section.append(form);
   }
 
   return section;
 }
 
-function buildCardEl(card, { archived = false } = {}) {
+function buildCardEl(card, { archived = false, index = 0, count = 1, columnName = "" } = {}) {
   const li = document.createElement("li");
   li.dataset.cardId = card.id;
   li.draggable = canEditBoard() && !archived;
@@ -213,7 +246,14 @@ function buildCardEl(card, { archived = false } = {}) {
   const link = document.createElement("a");
   link.href = cardHref(card.id);
   link.draggable = false;
-  link.textContent = card.title || "Untitled";
+  link.dataset.cardLink = "";
+  link.append(document.createTextNode(card.title || "Untitled"));
+  const place = document.createElement("span");
+  place.className = "visually-hidden";
+  const where = `${index + 1} of ${count} in ${columnName || "this column"}`;
+  const movable = canEditBoard() && !archived;
+  place.textContent = movable ? `, ${where}. Arrow keys move this card.` : `, ${where}.`;
+  link.append(place);
   li.append(link);
 
   const meta = [card.assignee, card.due].filter(Boolean).join(" · ");
@@ -242,15 +282,50 @@ function buildCardEl(card, { archived = false } = {}) {
     restore.dataset.action = "restore";
     restore.dataset.cardId = card.id;
     restore.textContent = "Restore";
+    restore.setAttribute("aria-label", `Restore ${card.title || "Untitled"}`);
     li.append(restore);
+  } else if (canEditBoard()) {
+    const move = document.createElement("button");
+    move.type = "button";
+    move.className = "btn";
+    move.dataset.action = "move-menu";
+    move.dataset.cardId = card.id;
+    move.setAttribute("aria-haspopup", "menu");
+    move.setAttribute("aria-expanded", "false");
+    move.setAttribute("aria-label", `Move ${card.title || "Untitled"}`);
+    move.textContent = "Move";
+    move.addEventListener("pointerdown", () => holdCardStill(li));
+    li.append(move);
   }
 
   return li;
 }
 
+/** A press on a control inside a draggable card should not start a drag. */
+function holdCardStill(cardEl) {
+  if (!cardEl) return;
+  cardEl.draggable = false;
+  const release = () => {
+    if (cardEl.isConnected && canEditBoard()) cardEl.draggable = true;
+    document.removeEventListener("pointerup", release);
+    document.removeEventListener("pointercancel", release);
+  };
+  document.addEventListener("pointerup", release);
+  document.addEventListener("pointercancel", release);
+}
+
 function renderArchived(cards) {
   archivedStrip.hidden = cards.length === 0;
-  archivedList.replaceChildren(...cards.map((card) => buildCardEl(card, { archived: true })));
+  archivedList.replaceChildren(
+    ...cards.map((card, index) =>
+      buildCardEl(card, {
+        archived: true,
+        index,
+        count: cards.length,
+        columnName: "Archived",
+      }),
+    ),
+  );
 }
 
 function captureUi() {
@@ -277,7 +352,35 @@ function captureUi() {
     };
   }
 
-  return { composer, columnName };
+  let columnAction = null;
+  if (active?.matches?.("[data-action]") && COLUMN_ACTIONS.has(active.dataset.action) && boardEl.contains(active)) {
+    columnAction = {
+      id: active.closest("[data-column-id]")?.dataset.columnId,
+      action: active.dataset.action,
+    };
+  }
+
+  const cardFocus = captureCardFocus(boardEl) || captureCardFocus(archivedList);
+
+  return { composer, columnName, columnAction, cardFocus };
+}
+
+function captureCardFocus(root) {
+  const active = document.activeElement;
+  if (!active || !root?.contains(active)) return null;
+  const item = active.closest("[data-card-id]");
+  if (!item || !root.contains(item)) return null;
+  const id = item.dataset.cardId;
+  if (active.matches("[data-action='move-menu']")) return { id, part: "move" };
+  if (active.matches("[data-action='restore']")) return { id, part: "restore" };
+  if (active.closest("[data-card-link]")) return { id, part: "link" };
+  return null;
+}
+
+function cardItem(cardId) {
+  if (!cardId) return null;
+  const selector = `[data-card-id="${CSS.escape(cardId)}"]`;
+  return boardEl.querySelector(selector) || archivedList.querySelector(selector);
 }
 
 function caretOffset(el) {
@@ -309,6 +412,47 @@ function restoreUi(ui) {
     const start = composer.start ?? input.value.length;
     input.setSelectionRange(start, composer.end ?? start);
   }
+
+  if (ui.cardFocus?.id) {
+    const item = cardItem(ui.cardFocus.id);
+    const target =
+      ui.cardFocus.part === "move"
+        ? item?.querySelector("[data-action='move-menu']")
+        : ui.cardFocus.part === "restore"
+          ? item?.querySelector("[data-action='restore']")
+          : item?.querySelector("[data-card-link]");
+    target?.focus();
+  }
+
+  if (ui.columnAction?.id && ui.columnAction.action) {
+    const button = boardEl.querySelector(
+      `[data-column-id="${CSS.escape(ui.columnAction.id)}"] [data-action="${CSS.escape(ui.columnAction.action)}"]`,
+    );
+    if (button && !button.disabled) button.focus();
+    else if (!document.activeElement || document.activeElement === document.body) {
+      boardEl
+        .querySelector(`[data-column-id="${CSS.escape(ui.columnAction.id)}"] [data-column-name]`)
+        ?.focus();
+    }
+  }
+
+  restoreLostFocus();
+}
+
+function restoreLostFocus() {
+  const pending = focusAfterRender;
+  focusAfterRender = null;
+  if (!pending) return;
+  const active = document.activeElement;
+  if (active && active !== document.body && active.isConnected) return;
+  if (pending.addColumn) {
+    newColumnInput.focus();
+    return;
+  }
+  const heading = boardEl.querySelector(
+    `[data-column-id="${CSS.escape(pending.columnId)}"] [data-column-name]`,
+  );
+  heading?.focus();
 }
 
 function focusEditable(el, offset) {
@@ -352,16 +496,192 @@ function isNoopMove(cardId, columnId, beforeId) {
 }
 
 async function moveCard(cardId, columnId, beforeId) {
-  if (!doc || !cardId || !columnId || beforeId === cardId) return;
-  if (isNoopMove(cardId, columnId, beforeId)) return;
+  if (!doc || !cardId || !columnId || beforeId === cardId) return false;
+  if (isNoopMove(cardId, columnId, beforeId)) return true;
   setError("");
   try {
     const body = { columnId };
     if (beforeId) body.beforeId = beforeId;
     await requestJson(API.cardMove(boardId, cardId), { method: "POST", body });
+    return true;
   } catch (err) {
     setError(err.message);
+    return false;
   }
+}
+
+/** Run moves one at a time so a second arrow reads the board after the first lands. */
+function enqueueCardMove(cardId, plan) {
+  moveQueue = moveQueue
+    .then(async () => {
+      if (!doc || missing) return;
+      const planned = plan();
+      if (!planned || planned.blocked) {
+        if (planned?.blocked) announce(planned.blocked);
+        return;
+      }
+      if (isNoopMove(cardId, planned.columnId, planned.beforeId)) return;
+      const ok = await moveCard(cardId, planned.columnId, planned.beforeId);
+      if (ok) await waitForPlacement(cardId, planned.columnId, planned.beforeId);
+    })
+    .catch(() => {});
+}
+
+function waitForPlacement(cardId, columnId, beforeId) {
+  if (!doc || isNoopMove(cardId, columnId, beforeId)) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const done = () => {
+      doc?.off("update", onUpdate);
+      clearTimeout(timer);
+      resolve();
+    };
+    const onUpdate = () => {
+      if (isNoopMove(cardId, columnId, beforeId)) done();
+    };
+    timer = setTimeout(done, 2000);
+    doc.on("update", onUpdate);
+  });
+}
+
+function closeMoveMenu({ restoreFocus = false } = {}) {
+  if (!openMenu) return;
+  const { button, menu } = openMenu;
+  openMenu = null;
+  if (button.isConnected) {
+    button.setAttribute("aria-expanded", "false");
+    button.removeAttribute("aria-controls");
+  }
+  menu.remove();
+  if (restoreFocus && button.isConnected) button.focus();
+  // Let the click or key that closed the menu finish before swapping the board.
+  if (!renderPending || dragCardId || openMenu) return;
+  setTimeout(() => {
+    if (!renderPending || dragCardId || openMenu) return;
+    renderFromDoc();
+  }, 0);
+}
+
+function openMoveMenu(button) {
+  if (!doc || !canEditBoard()) return;
+  const cardId = button?.dataset.cardId;
+  if (!cardId) return;
+  if (openMenu?.cardId === cardId) {
+    closeMoveMenu({ restoreFocus: true });
+    return;
+  }
+  closeMoveMenu({ restoreFocus: false });
+  const live =
+    boardEl.querySelector(
+      `[data-card-id="${CSS.escape(cardId)}"] [data-action="move-menu"]`,
+    ) || button;
+  if (!live.isConnected) return;
+  const menu = buildMoveMenu(cardId);
+  if (!menu) return;
+  live.setAttribute("aria-expanded", "true");
+  live.setAttribute("aria-controls", menu.id);
+  live.after(menu);
+  openMenu = { cardId, button: live, menu };
+  const items = [...menu.querySelectorAll("[role='menuitem']")];
+  items[0]?.focus();
+}
+
+function buildMoveMenu(cardId) {
+  const board = readBoard(doc);
+  const card = board.cards.find((item) => item.id === cardId);
+  if (!card || card.archived) return null;
+  const menu = document.createElement("div");
+  menu.className = "move-menu";
+  menu.dataset.moveMenu = "";
+  menu.id = `move-menu-${cardId}`;
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", `Move ${card.title || "Untitled"}`);
+  menu.addEventListener("pointerdown", () => holdCardStill(menu.closest("[data-card-id]")));
+  addMoveItem(menu, cardId, "Up", { key: "ArrowUp" });
+  addMoveItem(menu, cardId, "Down", { key: "ArrowDown" });
+  for (const column of board.columns) {
+    if (column.id === card.columnId) continue;
+    addMoveItem(menu, cardId, `To ${column.name || "Untitled"}`, { columnId: column.id });
+  }
+  return menu;
+}
+
+function addMoveItem(menu, cardId, label, kind) {
+  const item = document.createElement("button");
+  item.type = "button";
+  item.setAttribute("role", "menuitem");
+  item.dataset.moveAction = "";
+  item.tabIndex = -1;
+  item.textContent = label;
+  const board = readBoard(doc);
+  const planned = kind.key
+    ? planCardNudge(board.columns, board.cards, cardId, kind.key)
+    : planMoveToColumn(board.columns, board.cards, cardId, kind.columnId);
+  if (!planned || planned.blocked) {
+    item.setAttribute("aria-disabled", "true");
+    if (planned?.blocked) {
+      item.dataset.blocked = planned.blocked;
+      const reason = document.createElement("span");
+      reason.className = "visually-hidden";
+      reason.textContent = `, ${planned.blocked}`;
+      item.append(reason);
+    }
+  }
+  item.addEventListener("click", () => {
+    if (item.dataset.blocked) {
+      announce(item.dataset.blocked);
+      return;
+    }
+    if (item.getAttribute("aria-disabled") === "true") return;
+    closeMoveMenu({ restoreFocus: true });
+    enqueueCardMove(cardId, () => {
+      if (!doc) return null;
+      const live = readBoard(doc);
+      return kind.key
+        ? planCardNudge(live.columns, live.cards, cardId, kind.key)
+        : planMoveToColumn(live.columns, live.cards, cardId, kind.columnId);
+    });
+  });
+  menu.append(item);
+}
+
+function moveMenuFocus(menu, delta) {
+  const items = [...menu.querySelectorAll("[role='menuitem']")];
+  if (!items.length) return;
+  const current = items.indexOf(document.activeElement);
+  const start = current === -1 ? (delta > 0 ? -1 : 0) : current;
+  const index = (start + delta + items.length) % items.length;
+  items[index]?.focus();
+}
+
+function focusMenuEnd(menu, first) {
+  const items = [...menu.querySelectorAll("[role='menuitem']")];
+  const item = first ? items[0] : items[items.length - 1];
+  item?.focus();
+}
+
+const TABBABLE = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[contenteditable='plaintext-only']",
+].join(",");
+
+function isTabStop(el) {
+  if (!(el instanceof HTMLElement)) return false;
+  if (el.closest("[hidden], [data-move-menu]")) return false;
+  if (el.getAttribute("aria-hidden") === "true") return false;
+  if (el.tabIndex < 0) return false;
+  return el.getClientRects().length > 0;
+}
+
+function nextTabStop(from, direction) {
+  const stops = [...document.querySelectorAll(TABBABLE)].filter(isTabStop);
+  const index = stops.indexOf(from);
+  if (index < 0) return null;
+  return stops[index + direction] || null;
 }
 
 async function shiftColumn(columnId, direction) {
@@ -381,10 +701,15 @@ async function shiftColumn(columnId, direction) {
 }
 
 async function removeColumn(columnId) {
+  const ids = doc.getArray("columns").toArray().map((column) => column?.id);
+  const index = ids.indexOf(columnId);
+  const neighborId = ids[index + 1] || ids[index - 1] || null;
+  focusAfterRender = neighborId ? { columnId: neighborId } : { addColumn: true };
   setError("");
   try {
     await requestJson(API.column(boardId, columnId), { method: "DELETE" });
   } catch (err) {
+    focusAfterRender = null;
     setError(err.message);
   }
 }
@@ -471,7 +796,8 @@ function showMissing() {
   renderPending = false;
   releaseLive();
   boardNameEl.textContent = "Board not found";
-  boardNameEl.removeAttribute("contenteditable");
+  setTitleEditing(boardNameEl, false);
+  setBoardKeys(false);
   addColumnForm.hidden = true;
   boardEl.replaceChildren();
   archivedStrip.hidden = true;
@@ -504,6 +830,11 @@ boardEl.addEventListener("click", (event) => {
     event.preventDefault();
     return;
   }
+  const moveButton = event.target.closest("[data-action='move-menu']");
+  if (moveButton && boardEl.contains(moveButton)) {
+    openMoveMenu(moveButton);
+    return;
+  }
   const button = event.target.closest("[data-action]");
   if (!button || !boardEl.contains(button)) return;
   const columnId = button.closest("[data-column-id]")?.dataset.columnId;
@@ -532,22 +863,78 @@ boardEl.addEventListener("focusout", (event) => {
 });
 
 boardEl.addEventListener("keydown", (event) => {
-  if (!canEditBoard()) return;
-  if (!event.target.matches?.("[data-column-name]")) return;
-  if (event.key === "Enter") {
-    event.preventDefault();
-    event.target.blur();
-  } else if (event.key === "Escape") {
-    const columnId = event.target.closest("[data-column-id]")?.dataset.columnId;
-    const current = doc?.getArray("columns").toArray().find((column) => column?.id === columnId);
-    if (current) event.target.textContent = current.name;
-    event.preventDefault();
-    event.target.blur();
+  const menu = event.target.closest?.("[data-move-menu]");
+  if (menu && boardEl.contains(menu)) {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveMenuFocus(menu, 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveMenuFocus(menu, -1);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      focusMenuEnd(menu, true);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      focusMenuEnd(menu, false);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeMoveMenu({ restoreFocus: true });
+    } else if (event.key === "Tab") {
+      event.preventDefault();
+      const button = openMenu?.button ?? null;
+      const target = button ? nextTabStop(button, event.shiftKey ? -1 : 1) : null;
+      closeMoveMenu({ restoreFocus: false });
+      (target || button)?.focus();
+    }
+    return;
   }
+
+  if (!canEditBoard()) return;
+
+  if (event.target.matches?.("[data-column-name]")) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.target.blur();
+    } else if (event.key === "Escape") {
+      const columnId = event.target.closest("[data-column-id]")?.dataset.columnId;
+      const current = doc?.getArray("columns").toArray().find((column) => column?.id === columnId);
+      if (current) event.target.textContent = current.name;
+      event.preventDefault();
+      event.target.blur();
+    }
+    return;
+  }
+
+  if (event.target.matches?.("[data-action='move-menu']") && event.key === "ArrowDown") {
+    event.preventDefault();
+    openMoveMenu(event.target);
+    return;
+  }
+
+  const link = event.target.closest?.("[data-card-link]");
+  if (!link || !boardEl.contains(link) || !ARROW_KEYS.has(event.key)) return;
+  if (event.altKey || event.metaKey || event.ctrlKey || event.shiftKey || event.repeat) return;
+  event.preventDefault();
+  const cardId = link.closest("[data-card-id]")?.dataset.cardId;
+  const key = event.key;
+  if (!cardId) return;
+  enqueueCardMove(cardId, () => {
+    if (!doc) return null;
+    const board = readBoard(doc);
+    return planCardNudge(board.columns, board.cards, cardId, key);
+  });
 });
 
 boardEl.addEventListener("dragstart", (event) => {
   if (!canEditBoard()) return;
+  const fromControl = (event.composedPath?.() ?? []).some(
+    (node) => node instanceof Element && node.matches?.("button, [data-move-menu]"),
+  );
+  if (fromControl) {
+    event.preventDefault();
+    return;
+  }
   const item = event.target.closest?.("[data-card-id]");
   if (!item || !boardEl.contains(item) || !item.draggable) return;
   dragCardId = item.dataset.cardId;
@@ -556,6 +943,7 @@ boardEl.addEventListener("dragstart", (event) => {
   event.dataTransfer.setData("text/plain", dragCardId);
   item.classList.add("dragging");
   item.addEventListener("dragend", finishDrag, { once: true });
+  if (openMenu) closeMoveMenu({ restoreFocus: false });
 });
 
 boardEl.addEventListener("dragover", (event) => {
@@ -577,11 +965,20 @@ boardEl.addEventListener("drop", (event) => {
   event.preventDefault();
   clearDragOver();
   const cardId = dragCardId || event.dataTransfer.getData("text/plain");
+  const columnId = column.dataset.columnId;
   const beforeId = dropBeforeId(column, event);
-  void moveCard(cardId, column.dataset.columnId, beforeId);
+  enqueueCardMove(cardId, () => ({ columnId, beforeId }));
 });
 
 document.addEventListener("dragend", finishDrag);
+
+document.addEventListener("pointerdown", (event) => {
+  if (!openMenu) return;
+  const target = event.target;
+  if (!(target instanceof Node)) return;
+  if (openMenu.menu.contains(target) || openMenu.button.contains(target)) return;
+  closeMoveMenu({ restoreFocus: false });
+});
 
 archivedList.addEventListener("click", (event) => {
   if (!canEditBoard()) return;
@@ -697,6 +1094,10 @@ function renderMembers(members) {
     remove.type = "button";
     remove.className = "btn";
     remove.textContent = member.email === myEmail ? "Leave" : "Remove";
+    remove.setAttribute(
+      "aria-label",
+      member.email === myEmail ? "Leave board" : `Remove ${member.email}`,
+    );
     remove.disabled = onlyOwner;
     remove.addEventListener("click", () => {
       void removeMember(member.email);
@@ -739,11 +1140,8 @@ function showAccessChrome() {
   leaveBoardBtn.hidden = !myRole || myRole === "owner";
   addColumnForm.hidden = !canEditBoard();
   document.body.classList.toggle("view-only", myRole === "viewer");
-  if (isOwner()) {
-    boardNameEl.setAttribute("contenteditable", "plaintext-only");
-  } else {
-    boardNameEl.removeAttribute("contenteditable");
-  }
+  setTitleEditing(boardNameEl, isOwner(), BOARD_TITLE_HINT);
+  setBoardKeys(canEditBoard());
   unarchiveBtn.hidden = !isOwner();
 }
 
@@ -772,6 +1170,7 @@ copyInviteBtn?.addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(inviteLinkEl.value);
     copyInviteBtn.textContent = "Copied";
+    announce("Invite link copied");
     setTimeout(() => {
       copyInviteBtn.textContent = "Copy";
     }, 1500);
@@ -913,7 +1312,7 @@ async function bootstrap() {
     },
   });
   room.bindStatus(statusEl);
-  presence = bindPresence(presenceEl, room.awareness, { selfEmail: myEmail });
+  presence = bindPresence(presenceEl, room.awareness, { selfEmail: myEmail, ready: room.ready });
 
   doc = await room.ready;
   if (!doc) return;

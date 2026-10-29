@@ -27,6 +27,8 @@ const HYDRATE_WAIT_MS = 1500;
 
 export function setStatus(el, state, label) {
   if (!el) return;
+  // Same text again would retrigger a status live region on every sync frame.
+  if (el.dataset.state === state && el.textContent === label) return;
   el.dataset.state = state;
   el.textContent = label;
 }

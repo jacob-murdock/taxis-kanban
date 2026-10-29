@@ -85,8 +85,11 @@ function buildSignInForm() {
   input.required = true;
   input.autocomplete = "email";
   input.placeholder = "you@example.com";
-  input.setAttribute("aria-label", "Email");
   input.maxLength = 254;
+
+  const label = document.createElement("label");
+  label.className = "field-label";
+  label.append(document.createTextNode("Email"), input);
 
   const button = document.createElement("button");
   button.type = "submit";
@@ -97,7 +100,7 @@ function buildSignInForm() {
   hint.className = "auth-hint";
   hint.hidden = true;
 
-  form.append(input, button, hint);
+  form.append(label, button, hint);
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();

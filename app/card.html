@@ -8,19 +8,25 @@
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
+  <a class="skip-link" href="#content">Skip to card</a>
   <header class="site-header">
     <nav><a id="back-link" href="/">← Board</a></nav>
-    <h1 id="card-title" spellcheck="true" aria-label="Card title">Loading…</h1>
+    <h1 id="card-title" spellcheck="true">Loading…</h1>
     <p id="card-meta" class="card-meta muted"></p>
     <p id="page-error" class="page-error" role="alert"></p>
   </header>
 
-  <main class="card-page">
+  <main id="content" class="card-page" tabindex="-1">
     <aside class="card-fields">
       <dl>
         <dt><label for="field-column">Column</label></dt>
         <dd>
           <select id="field-column" disabled></select>
+        </dd>
+
+        <dt><label for="field-position">Position</label></dt>
+        <dd>
+          <select id="field-position" disabled></select>
         </dd>
 
         <dt><label for="field-assignee">Assignee</label></dt>
@@ -61,8 +67,9 @@
   </main>
 
   <footer class="site-footer">
-    <p id="connection-status" class="connection-status" data-state="connecting">Connecting…</p>
+    <p id="connection-status" class="connection-status" role="status" data-state="connecting">Connecting…</p>
     <div id="presence" class="presence" hidden></div>
+    <div id="activity-log" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
   </footer>
 
   <script type="module" src="/js/card.js"></script>

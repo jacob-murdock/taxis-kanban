@@ -101,7 +101,7 @@ function buildRow(board, draft) {
     input.value = draft;
     input.maxLength = NAME_MAX;
     input.autocomplete = "off";
-    input.setAttribute("aria-label", "Board name");
+    input.setAttribute("aria-label", `Rename ${board.name || "board"}`);
     li.append(input);
   } else {
     const link = document.createElement("a");
@@ -120,6 +120,7 @@ function buildRow(board, draft) {
       rename.className = "btn";
       rename.dataset.action = "rename";
       rename.textContent = "Rename";
+      rename.setAttribute("aria-label", `Rename ${board.name || "board"}`);
       li.append(rename);
     }
   }
@@ -130,6 +131,10 @@ function buildRow(board, draft) {
     archive.className = "btn";
     archive.dataset.action = "archive";
     archive.textContent = board.archived ? "Restore" : "Archive";
+    archive.setAttribute(
+      "aria-label",
+      `${board.archived ? "Restore" : "Archive"} ${board.name || "board"}`,
+    );
     li.append(archive);
   }
   return li;

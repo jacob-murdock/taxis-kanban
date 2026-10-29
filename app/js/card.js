@@ -1,8 +1,12 @@
 /** Card page. Field edits go out on the card socket. Column, archive, and delete use HTTP. */
 
+import { announce } from "./announce.js";
+import { describeCardChanges } from "./change-summary.js";
+import { positionChoices } from "./card-nudge.js";
 import { API, readRouteIds, requestJson, settleRevokedAccess, stillExists } from "./config.js";
 import { readCard } from "./card-model.js";
 import { cardDocKey, clearDoc } from "./doc-store.js";
+import { CARD_TITLE_HINT, setTitleEditing } from "./editable-title.js";
 import { cachedSession, rememberSession } from "./local-session.js";
 import { bindPresence } from "./presence.js";
 import { applyTextDiff, mapIndexThroughTextDiff } from "./text-diff.js";
@@ -22,6 +26,7 @@ const titleEl = document.getElementById("card-title");
 const metaEl = document.getElementById("card-meta");
 const errorEl = document.getElementById("page-error");
 const fieldColumn = document.getElementById("field-column");
+const fieldPosition = document.getElementById("field-position");
 const fieldAssignee = document.getElementById("field-assignee");
 const fieldDue = document.getElementById("field-due");
 const fieldBody = document.getElementById("card-body");
@@ -44,6 +49,9 @@ let myRole = null;
 let myEmail = null;
 let presence = null;
 let room = null;
+let renderedCard = null;
+let boardCards = [];
+let fillingPosition = false;
 const focused = new Set();
 
 function canEditCard() {
@@ -77,6 +85,7 @@ function showDeleted() {
   // Stop the persist listener before deleting, or an in-flight write lands after.
   releaseLive();
   if (key) void clearDoc(key);
+  setTitleEditing(titleEl, false);
   titleEl.textContent = "Card deleted";
   setStatus(statusEl, "error", "This card was deleted");
 }
@@ -96,9 +105,9 @@ function setField(key, value) {
 function applyViewOnly() {
   const editable = canEditCard();
   document.body.classList.toggle("view-only", !editable);
-  if (editable) titleEl.setAttribute("contenteditable", "plaintext-only");
-  else titleEl.removeAttribute("contenteditable");
+  setTitleEditing(titleEl, editable, CARD_TITLE_HINT);
   fieldColumn.disabled = !editable;
+  fieldPosition.disabled = !editable;
   fieldAssignee.disabled = !editable;
   fieldDue.disabled = !editable;
   fieldBody.readOnly = !editable;
@@ -161,6 +170,7 @@ async function bootstrap() {
     if (err.status === 401) return;
   }
   if (!boardId || !cardId) {
+    setTitleEditing(titleEl, false);
     titleEl.textContent = "Card not found";
     setStatus(statusEl, "error", "Missing card");
     return;
@@ -178,6 +188,7 @@ async function bootstrap() {
       if (err.status === 404 && emailFromNetwork && myEmail) {
         void clearDoc(cardDocKey(myEmail, boardId, cardId));
       }
+      setTitleEditing(titleEl, false);
       titleEl.textContent = "Card not found";
       setStatus(statusEl, "error", err.message);
       return;
@@ -218,7 +229,10 @@ async function bootstrap() {
   });
   room = liveRoom;
   liveRoom.bindStatus(statusEl);
-  presence = bindPresence(presenceEl, liveRoom.awareness, { selfEmail: myEmail });
+  presence = bindPresence(presenceEl, liveRoom.awareness, {
+    selfEmail: myEmail,
+    ready: liveRoom.ready,
+  });
   if (roleFromCache) void confirmCachedRole();
 
   let listening = false;
@@ -229,7 +243,13 @@ async function bootstrap() {
     if (listening) return;
     listening = true;
     doc.on("update", (_update, origin) => {
+      const prev = renderedCard;
       renderFromDoc();
+      if (origin === "remote" && prev && renderedCard && !gone) {
+        for (const note of describeCardChanges(prev, renderedCard, { columns, skip: focused })) {
+          announce(note);
+        }
+      }
       // Local keystrokes do not echo back; refresh after commits instead.
       if (origin === "remote") scheduleHistoryRefresh();
     });
@@ -245,15 +265,58 @@ async function bootstrap() {
   bindDoc(live);
 }
 
-async function loadColumns() {
+async function loadColumns({ forcePosition = false } = {}) {
   try {
     const board = await requestJson(API.boardSnapshot(boardId));
     columns = Array.isArray(board.columns) ? board.columns : [];
+    boardCards = readBoardCards(board.cards);
     if (doc) fillColumnSelect(selectedColumnId());
   } catch (err) {
     // A network miss still leaves the saved card editable. A real HTTP error does not.
     if (err.status) setError(err.message);
   }
+  if (doc) fillPositionSelect({ force: forcePosition });
+}
+
+function readBoardCards(cards) {
+  if (!cards || typeof cards !== "object") return [];
+  return Object.entries(cards).map(([key, card]) => ({
+    id: String(card?.id || key),
+    title: String(card?.title ?? ""),
+    columnId: card?.columnId ?? null,
+    rank: Number(card?.rank) || 0,
+    archived: card?.archived === true,
+  }));
+}
+
+function fillPositionSelect({ force = false } = {}) {
+  if (!fieldPosition || !doc || gone) return;
+  if (!force && document.activeElement === fieldPosition) return;
+  const columnId = selectedColumnId();
+  const archived = readCard(doc).archived === true;
+  fillingPosition = true;
+  fieldPosition.replaceChildren();
+  if (archived) {
+    const parked = document.createElement("option");
+    parked.value = "";
+    parked.textContent = "Archived";
+    fieldPosition.append(parked);
+    fieldPosition.disabled = true;
+    fillingPosition = false;
+    return;
+  }
+  const choice = positionChoices(boardCards, columnId, cardId);
+  for (const option of choice.options) {
+    const el = document.createElement("option");
+    el.value = option.value;
+    el.textContent = option.label;
+    fieldPosition.append(el);
+  }
+  if ([...fieldPosition.options].some((option) => option.value === choice.beforeId)) {
+    fieldPosition.value = choice.beforeId;
+  }
+  fieldPosition.disabled = !canEditCard() || !choice.movable;
+  fillingPosition = false;
 }
 
 function selectedColumnId() {
@@ -302,6 +365,7 @@ function renderFromDoc() {
   document.title = `${card.title} · Taxis Kanban`;
 
   fillColumnSelect(selectedColumnId());
+  fillPositionSelect();
 
   if (!focused.has("assignee") && fieldAssignee.value !== card.assignee) {
     fieldAssignee.value = card.assignee;
@@ -325,6 +389,15 @@ function renderFromDoc() {
 
   renderLabels(card.labels);
   archiveBtn.textContent = card.archived ? "Restore" : "Archive";
+  renderedCard = {
+    title: card.title,
+    columnId: card.columnId,
+    assignee: card.assignee,
+    due: card.due,
+    labels: card.labels.slice(),
+    archived: card.archived,
+    body: card.body,
+  };
   syncing = false;
 }
 
@@ -357,13 +430,23 @@ function wireEditors() {
   trackFocus(labelInput, "label");
 
   titleEl.addEventListener("keydown", (event) => {
+    if (!canEditCard() || !doc) return;
     if (event.key === "Enter") {
       event.preventDefault();
+      titleEl.blur();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      titleEl.dataset.cancel = "true";
+      titleEl.textContent = readCard(doc).title;
       titleEl.blur();
     }
   });
 
   titleEl.addEventListener("blur", () => {
+    if (titleEl.dataset.cancel) {
+      delete titleEl.dataset.cancel;
+      return;
+    }
     if (!canEditCard() || !doc || syncing || gone) return;
     setField("title", oneLine(titleEl.textContent ?? "", TITLE_MAX) || "Untitled");
     scheduleHistoryRefresh();
@@ -380,12 +463,40 @@ function wireEditors() {
       method: "POST",
       body: { columnId },
     })
-      .then(() => scheduleHistoryRefresh())
+      .then(() => {
+        scheduleHistoryRefresh();
+        return loadColumns({ forcePosition: true });
+      })
       .catch((err) => {
         pendingColumnId = null;
         columnSignature = "";
         setError(err.message);
         fillColumnSelect(current, { force: true });
+        fillPositionSelect({ force: true });
+      });
+  });
+
+  fieldPosition.addEventListener("change", () => {
+    if (fillingPosition || !canEditCard() || !doc || syncing || gone) return;
+    const columnId = selectedColumnId();
+    if (!columnId) return;
+    const choice = positionChoices(boardCards, columnId, cardId);
+    const beforeId = fieldPosition.value || "";
+    if (beforeId === (choice.beforeId || "")) return;
+    const spoken = fieldPosition.selectedOptions[0]?.textContent || "the new position";
+    const sentence = `Position is now ${spoken.charAt(0).toLowerCase()}${spoken.slice(1)}`;
+    setError("");
+    fieldPosition.disabled = true;
+    const body = { columnId };
+    if (beforeId) body.beforeId = beforeId;
+    void requestJson(API.cardMove(boardId, cardId), { method: "POST", body })
+      .then(async () => {
+        announce(sentence);
+        await loadColumns({ forcePosition: true });
+      })
+      .catch((err) => {
+        setError(err.message);
+        fillPositionSelect({ force: true });
       });
   });
 

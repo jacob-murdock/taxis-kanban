@@ -11,8 +11,8 @@ Make as many boards as you like, each with its own columns. Everyone on a board 
 - **Magic-link sign-in.** Email a one-time link; a signed session cookie keeps you in. Mail goes through Resend when configured, otherwise the link is logged to the Worker console.
 - **Per-board roles.** Owner, editor, and viewer. Owners manage members and invites; editors change the board and cards; viewers watch live but cannot write.
 - **Board list.** Create, rename, archive and restore boards you belong to.
-- **Live boards.** New boards start with To do / Doing / Done. Add, rename, reorder and delete columns, then drag cards within or between columns. Every open copy of the board updates.
-- **Live card pages.** Title, assignee, due date and labels are shared fields. The body is a shared text document that merges character by character, so two people typing in different places don't overwrite each other.
+- **Live boards.** New boards start with To do / Doing / Done. Add, rename, reorder and delete columns, then drag cards within or between columns. A focused card also moves with the arrow keys, or from its Move menu. Every open copy of the board updates.
+- **Live card pages.** Title, assignee, due date and labels are shared fields. Column and position place the card in its column. The body is a shared text document that merges character by character, so two people typing in different places don't overwrite each other.
 - **Change history.** Every card edit is recorded with author, old and new value, and shown on the card page. Each card keeps the newest 500 entries.
 - **Board export.** Download one JSON dump of the board, its materialized cards, and each card's changelog. A large board is read a page of cards at a time.
 - **Archive and delete.** Archived cards leave their column and can be restored. Deleted cards are tombstoned, so a stale client can't bring them back.
@@ -163,7 +163,7 @@ app/
     yjs-sync.js             client room connection + awareness
     presence.js             presence list UI
     auth.js  invite.js  boards.js  board.js  card.js  card-model.js
-    text-diff.js  config.js
+    text-diff.js  config.js  announce.js  card-nudge.js  change-summary.js  editable-title.js
     vendor/                 bundled Yjs + ws-sync (generated)
 scripts/smoke.mjs           local smoke against a temporary wrangler dev
 test/                       unit tests and Workers integration tests
