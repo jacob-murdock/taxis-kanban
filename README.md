@@ -2,6 +2,8 @@
 
 **A realtime collaborative kanban on Cloudflare Workers, Durable Objects and Yjs.**
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jacob-murdock/taxis-kanban)
+
 Make as many boards as you like, each with its own columns. Everyone on a board sees cards appear and move as they happen. Open a card and several people can edit it at once: edits merge on their own, with no save button and no conflict dialog. Each card keeps a field-level history of what changed. Access is gated by magic-link sign-in and per-board roles.
 
 ---
@@ -113,9 +115,9 @@ npx wrangler dev --local
 
 Open http://localhost:8787. Sign in with any email; when `RESEND_API_KEY` is unset the magic link is printed in the wrangler console. Wrangler runs `npm run build:client` first, which bundles Yjs into `app/js/vendor/`.
 
-Local Durable Object state lives in `.wrangler/`. Boards created before auth have no members and are unreachable after gating lands — delete `.wrangler/` (or recreate boards) to start fresh.
+Local Durable Object state lives in `.wrangler/`; delete it to start fresh.
 
-Deploy with `npx wrangler deploy`, then set secrets:
+Deploy with the button above, or with `npx wrangler deploy`. Either way, set the secrets:
 
 ```sh
 npx wrangler secret put SESSION_SECRET   # required; long random string

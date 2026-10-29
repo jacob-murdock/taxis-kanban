@@ -40,3 +40,8 @@ binding = "ASSETS"
 not_found_handling = "404-page"
 # Unknown paths would otherwise be served as index.html before this Worker runs.
 run_worker_first = true
+
+# Optional. Secrets (SESSION_SECRET, RESEND_API_KEY) go through `wrangler secret put`.
+# [vars]
+# MAIL_FROM = "Taxis Kanban <noreply@your-domain>"
+# APP_URL = "https://kanban.your-domain"

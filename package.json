@@ -3,6 +3,13 @@
   "private": true,
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jacob-murdock/taxis-kanban.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build:client": "esbuild yjs --bundle --format=esm --minify --outfile=app/js/vendor/yjs.js && esbuild src/lib/ws-sync.js --bundle --format=esm --minify --alias:yjs=./yjs.js --external:./yjs.js --outfile=app/js/vendor/ws-sync.js",
     "dev": "wrangler dev",
