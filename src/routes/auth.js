@@ -264,10 +264,15 @@ function htmlPage(title, bodyHtml, status) {
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex, nofollow">
   <title>${escapeHtml(title)} · Taxis Kanban</title>
+  <script src="/js/theme.js"></script>
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
   <header class="site-header">
+    <div class="header-top">
+      <nav><a href="/">← Boards</a></nav>
+      <button type="button" class="btn theme-toggle" data-theme-toggle>Theme: system</button>
+    </div>
     <h1>Taxis Kanban</h1>
     <p class="tagline">${escapeHtml(title)}</p>
   </header>

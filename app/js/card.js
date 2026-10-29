@@ -8,6 +8,8 @@ import { readCard } from "./card-model.js";
 import { cardDocKey, clearDoc } from "./doc-store.js";
 import { CARD_TITLE_HINT, setTitleEditing } from "./editable-title.js";
 import { cachedSession, rememberSession } from "./local-session.js";
+import { formatHistoryEntry } from "./history-format.js";
+import { renderMarkdown } from "./markdown.js";
 import { bindPresence } from "./presence.js";
 import { applyTextDiff, mapIndexThroughTextDiff } from "./text-diff.js";
 import { connectYjsRoom, setStatus } from "./yjs-sync.js";
@@ -30,6 +32,8 @@ const fieldPosition = document.getElementById("field-position");
 const fieldAssignee = document.getElementById("field-assignee");
 const fieldDue = document.getElementById("field-due");
 const fieldBody = document.getElementById("card-body");
+const previewEl = document.getElementById("card-preview");
+const NOTES_PLACEHOLDER = "Markdown notes…";
 const labelList = document.getElementById("label-list");
 const labelForm = document.getElementById("label-form");
 const labelInput = document.getElementById("field-label");
@@ -52,6 +56,8 @@ let room = null;
 let renderedCard = null;
 let boardCards = [];
 let fillingPosition = false;
+let notesSource = null;
+let historyEntries = [];
 const focused = new Set();
 
 function canEditCard() {
@@ -266,6 +272,7 @@ async function bootstrap() {
 }
 
 async function loadColumns({ forcePosition = false } = {}) {
+  const previousColumns = columns.map((column) => `${column.id}:${column.name}`).join("|");
   try {
     const board = await requestJson(API.boardSnapshot(boardId));
     columns = Array.isArray(board.columns) ? board.columns : [];
@@ -276,6 +283,8 @@ async function loadColumns({ forcePosition = false } = {}) {
     if (err.status) setError(err.message);
   }
   if (doc) fillPositionSelect({ force: forcePosition });
+  const nextColumns = columns.map((column) => `${column.id}:${column.name}`).join("|");
+  if (nextColumns !== previousColumns && historyEntries.length) renderHistory(historyEntries);
 }
 
 function readBoardCards(cards) {
@@ -386,6 +395,7 @@ function renderFromDoc() {
       fieldBody.value = card.body;
     }
   }
+  if (!focused.has("body")) showNotesPreview();
 
   renderLabels(card.labels);
   archiveBtn.textContent = card.archived ? "Restore" : "Archive";
@@ -428,6 +438,23 @@ function wireEditors() {
   trackFocus(fieldDue, "due");
   trackFocus(fieldBody, "body");
   trackFocus(labelInput, "label");
+
+  previewEl?.addEventListener("focus", () => {
+    showNotesEditor(true);
+  });
+  document.querySelector("label[for='card-body']")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    showNotesEditor(true);
+  });
+  fieldBody.addEventListener("focus", () => {
+    showNotesEditor(false);
+  });
+  fieldBody.addEventListener("blur", () => {
+    queueMicrotask(() => {
+      if (document.activeElement === fieldBody) return;
+      showNotesPreview();
+    });
+  });
 
   titleEl.addEventListener("keydown", (event) => {
     if (!canEditCard() || !doc) return;
@@ -613,10 +640,43 @@ function scheduleHistoryRefresh() {
 async function loadHistory() {
   try {
     const { entries } = await requestJson(API.cardHistory(boardId, cardId));
-    renderHistory(entries ?? []);
+    historyEntries = entries ?? [];
+    renderHistory(historyEntries);
   } catch {
     // History is best-effort; the page works without it.
   }
+}
+
+function showNotesEditor(focusAtEnd) {
+  if (!previewEl) return;
+  fieldBody.hidden = false;
+  if (focusAtEnd && document.activeElement !== fieldBody) {
+    fieldBody.focus();
+    const end = fieldBody.value.length;
+    try {
+      fieldBody.setSelectionRange(end, end);
+    } catch {
+      /* The control can reject a selection if it is not shown yet. */
+    }
+  }
+  previewEl.hidden = true;
+}
+
+function showNotesPreview() {
+  if (!previewEl) return;
+  if (document.activeElement === fieldBody) return;
+  fieldBody.hidden = true;
+  previewEl.hidden = false;
+  const value = fieldBody.value;
+  if (notesSource === value && previewEl.childNodes.length) return;
+  notesSource = value;
+  if (!value) {
+    previewEl.classList.add("placeholder");
+    previewEl.replaceChildren(document.createTextNode(NOTES_PLACEHOLDER));
+    return;
+  }
+  previewEl.classList.remove("placeholder");
+  renderMarkdown(previewEl, value);
 }
 
 function renderHistory(entries) {
@@ -629,10 +689,25 @@ function renderHistory(entries) {
     return;
   }
 
+  const now = Date.now();
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   for (const entry of entries) {
+    const formatted = formatHistoryEntry(entry, { columns, now, timeZone });
     const li = document.createElement("li");
-    const author = entry.author ? `${entry.author} · ` : "";
-    li.textContent = `${entry.ts} — ${author}${entry.field}: ${entry.prev ?? "∅"} → ${entry.next ?? "∅"}`;
+    li.className = "history-item";
+    const time = document.createElement("time");
+    if (formatted.datetime) time.dateTime = formatted.datetime;
+    time.append(document.createTextNode(formatted.relative));
+    if (formatted.suffix) {
+      const extra = document.createElement("span");
+      extra.className = "visually-hidden";
+      extra.textContent = `, ${formatted.suffix}`;
+      time.append(extra);
+    }
+    const detail = document.createElement("span");
+    detail.className = "history-summary";
+    detail.textContent = formatted.author ? `${formatted.author} · ${formatted.summary}` : formatted.summary;
+    li.append(time, detail);
     historyList.append(li);
   }
 }

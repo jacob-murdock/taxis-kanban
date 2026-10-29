@@ -276,6 +276,8 @@ function buildCardEl(card, { archived = false, index = 0, count = 1, columnName 
   }
 
   if (archived && canEditBoard()) {
+    const actions = document.createElement("div");
+    actions.className = "card-quick";
     const restore = document.createElement("button");
     restore.type = "button";
     restore.className = "btn";
@@ -283,8 +285,12 @@ function buildCardEl(card, { archived = false, index = 0, count = 1, columnName 
     restore.dataset.cardId = card.id;
     restore.textContent = "Restore";
     restore.setAttribute("aria-label", `Restore ${card.title || "Untitled"}`);
-    li.append(restore);
+    actions.append(restore);
+    li.append(actions);
   } else if (canEditBoard()) {
+    const actions = document.createElement("div");
+    actions.className = "card-quick";
+    const name = card.title || "Untitled";
     const move = document.createElement("button");
     move.type = "button";
     move.className = "btn";
@@ -292,10 +298,19 @@ function buildCardEl(card, { archived = false, index = 0, count = 1, columnName 
     move.dataset.cardId = card.id;
     move.setAttribute("aria-haspopup", "menu");
     move.setAttribute("aria-expanded", "false");
-    move.setAttribute("aria-label", `Move ${card.title || "Untitled"}`);
+    move.setAttribute("aria-label", `Move ${name}`);
     move.textContent = "Move";
     move.addEventListener("pointerdown", () => holdCardStill(li));
-    li.append(move);
+    const archive = document.createElement("button");
+    archive.type = "button";
+    archive.className = "btn";
+    archive.dataset.action = "archive-card";
+    archive.dataset.cardId = card.id;
+    archive.textContent = "Archive";
+    archive.setAttribute("aria-label", `Archive ${name}`);
+    archive.addEventListener("pointerdown", () => holdCardStill(li));
+    actions.append(move, archive);
+    li.append(actions);
   }
 
   return li;
@@ -372,6 +387,7 @@ function captureCardFocus(root) {
   if (!item || !root.contains(item)) return null;
   const id = item.dataset.cardId;
   if (active.matches("[data-action='move-menu']")) return { id, part: "move" };
+  if (active.matches("[data-action='archive-card']")) return { id, part: "archive" };
   if (active.matches("[data-action='restore']")) return { id, part: "restore" };
   if (active.closest("[data-card-link]")) return { id, part: "link" };
   return null;
@@ -418,9 +434,12 @@ function restoreUi(ui) {
     const target =
       ui.cardFocus.part === "move"
         ? item?.querySelector("[data-action='move-menu']")
-        : ui.cardFocus.part === "restore"
-          ? item?.querySelector("[data-action='restore']")
-          : item?.querySelector("[data-card-link]");
+        : ui.cardFocus.part === "archive"
+          ? item?.querySelector("[data-action='archive-card']") ||
+            item?.querySelector("[data-action='restore']")
+          : ui.cardFocus.part === "restore"
+            ? item?.querySelector("[data-action='restore']")
+            : item?.querySelector("[data-card-link]");
     target?.focus();
   }
 
@@ -580,7 +599,9 @@ function openMoveMenu(button) {
   if (!menu) return;
   live.setAttribute("aria-expanded", "true");
   live.setAttribute("aria-controls", menu.id);
-  live.after(menu);
+  const cardEl = live.closest("[data-card-id]");
+  if (cardEl) cardEl.append(menu);
+  else live.after(menu);
   openMenu = { cardId, button: live, menu };
   const items = [...menu.querySelectorAll("[role='menuitem']")];
   items[0]?.focus();
@@ -835,6 +856,11 @@ boardEl.addEventListener("click", (event) => {
     openMoveMenu(moveButton);
     return;
   }
+  const archiveButton = event.target.closest("[data-action='archive-card']");
+  if (archiveButton && boardEl.contains(archiveButton)) {
+    void archiveCard(archiveButton);
+    return;
+  }
   const button = event.target.closest("[data-action]");
   if (!button || !boardEl.contains(button)) return;
   const columnId = button.closest("[data-column-id]")?.dataset.columnId;
@@ -979,6 +1005,31 @@ document.addEventListener("pointerdown", (event) => {
   if (openMenu.menu.contains(target) || openMenu.button.contains(target)) return;
   closeMoveMenu({ restoreFocus: false });
 });
+
+async function archiveCard(button) {
+  const cardId = button?.dataset.cardId;
+  if (!cardId || !canEditBoard()) return;
+  // Keep the button focusable. `disabled` would blur it before the redraw
+  // can move focus to Restore.
+  if (button.getAttribute("aria-disabled") === "true") return;
+  button.setAttribute("aria-disabled", "true");
+  setError("");
+  try {
+    await requestJson(API.cardArchive(boardId, cardId), {
+      method: "POST",
+      body: { archived: true },
+    });
+    // The redraw may already have dropped focus when it removed this button.
+    const restore = document.querySelector(
+      `[data-card-id="${CSS.escape(cardId)}"] [data-action="restore"]`,
+    );
+    const fallen = document.activeElement === button || document.activeElement === document.body;
+    if (restore && fallen) restore.focus();
+  } catch (err) {
+    if (button.isConnected) button.removeAttribute("aria-disabled");
+    setError(err.message);
+  }
+}
 
 archivedList.addEventListener("click", (event) => {
   if (!canEditBoard()) return;

@@ -25,6 +25,25 @@ function presenceEmail(value) {
   return email;
 }
 
+const AVATAR_SLOTS = 6;
+
+function avatarSlot(email) {
+  let hash = 0;
+  const key = email.toLowerCase();
+  for (let i = 0; i < key.length; i += 1) hash = (hash * 33 + key.charCodeAt(i)) >>> 0;
+  return hash % AVATAR_SLOTS;
+}
+
+function initials(email) {
+  const local = email.split("@")[0] ?? "";
+  const parts = local.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  const letters =
+    parts.length >= 2
+      ? `${parts[0][0]}${parts[1][0]}`
+      : (parts[0] || local).replace(/[^a-zA-Z0-9]/g, "").slice(0, 2);
+  return (letters || "?").toUpperCase();
+}
+
 /**
  * Bind a presence list to an awareness instance.
  * Returns `{ setEditing, destroy }`.
@@ -71,8 +90,23 @@ export function bindPresence(el, awareness, { selfEmail, ready } = {}) {
     list.setAttribute("aria-label", "People here");
     for (const peer of peers) {
       const li = document.createElement("li");
+      li.className = "presence-avatar";
       const editing = EDITING_LABELS[peer.editing];
-      li.textContent = editing ? `${peer.email}, editing ${editing}` : peer.email;
+      const name = editing ? `${peer.email}, editing ${editing}` : peer.email;
+      if (peer.editing) li.classList.add("is-editing");
+
+      const avatar = document.createElement("span");
+      avatar.className = "avatar";
+      avatar.setAttribute("aria-hidden", "true");
+      avatar.title = name;
+      avatar.style.setProperty("--avatar", `var(--avatar-${avatarSlot(peer.email)})`);
+      avatar.textContent = initials(peer.email);
+
+      const text = document.createElement("span");
+      text.className = "visually-hidden";
+      text.textContent = name;
+
+      li.append(avatar, text);
       list.append(li);
     }
     el.replaceChildren(label, list);

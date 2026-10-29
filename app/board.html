@@ -5,12 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex, nofollow">
   <title>Board · Taxis Kanban</title>
+  <script src="/js/theme.js"></script>
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
   <a class="skip-link" href="#board">Skip to board</a>
   <header class="site-header">
-    <nav><a href="/">← Boards</a></nav>
+    <div class="header-top">
+      <nav><a href="/">← Boards</a></nav>
+      <button type="button" class="btn theme-toggle" data-theme-toggle>Theme: system</button>
+    </div>
     <h1 id="board-name" spellcheck="true">Loading…</h1>
     <p id="archived-banner" class="banner" hidden>
       This board is archived.
@@ -62,7 +66,7 @@
     <p id="connection-status" class="connection-status" role="status" data-state="connecting">Connecting…</p>
     <div id="presence" class="presence" hidden></div>
     <div id="activity-log" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
-    <p id="board-keys" class="visually-hidden" hidden>When a card title is focused, arrow keys move that card. Each card also has a Move button.</p>
+    <p id="board-keys" class="visually-hidden" hidden>When a card title is focused, arrow keys move that card. Each card also has Move and Archive buttons.</p>
   </footer>
 
   <script type="module" src="/js/board.js"></script>

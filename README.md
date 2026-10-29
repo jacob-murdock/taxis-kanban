@@ -163,7 +163,10 @@ app/
   index.html  board.html  card.html  invite.html  404.html  css/app.css
   js/
     yjs-sync.js             client room connection + awareness
-    presence.js             presence list UI
+    presence.js             presence avatars
+    theme.js                color theme before first paint
+    markdown.js             notes preview
+    history-format.js       readable history lines
     auth.js  invite.js  boards.js  board.js  card.js  card-model.js
     text-diff.js  config.js  announce.js  card-nudge.js  change-summary.js  editable-title.js
     vendor/                 bundled Yjs + ws-sync (generated)

@@ -5,12 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex, nofollow">
   <title>Card · Taxis Kanban</title>
+  <script src="/js/theme.js"></script>
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
   <a class="skip-link" href="#content">Skip to card</a>
   <header class="site-header">
-    <nav><a id="back-link" href="/">← Board</a></nav>
+    <div class="header-top">
+      <nav><a id="back-link" href="/">← Board</a></nav>
+      <button type="button" class="btn theme-toggle" data-theme-toggle>Theme: system</button>
+    </div>
     <h1 id="card-title" spellcheck="true">Loading…</h1>
     <p id="card-meta" class="card-meta muted"></p>
     <p id="page-error" class="page-error" role="alert"></p>
@@ -54,8 +58,9 @@
     </aside>
 
     <article class="card-notes">
-      <h2><label for="card-body">Notes</label></h2>
-      <textarea id="card-body" class="markdown-body" rows="16" placeholder="Markdown notes…" readonly></textarea>
+      <h2 id="notes-heading"><label for="card-body">Notes</label></h2>
+      <div id="card-preview" class="markdown-preview placeholder" tabindex="0">Markdown notes…</div>
+      <textarea id="card-body" class="markdown-body" rows="16" placeholder="Markdown notes…" readonly hidden></textarea>
     </article>
 
     <aside class="card-history">
